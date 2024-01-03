@@ -39,6 +39,7 @@ pub struct EthereumContractCall {
     pub block_ptr: BlockPtr,
     pub function: Function,
     pub args: Vec<Token>,
+    pub gas: Option<u32>,
 }
 
 #[derive(Error, Debug)]
@@ -195,9 +196,9 @@ pub(crate) struct EthereumLogFilter {
     wildcard_events: HashMap<EventSignature, bool>,
 }
 
-impl Into<Vec<LogFilter>> for EthereumLogFilter {
-    fn into(self) -> Vec<LogFilter> {
-        self.eth_get_logs_filters()
+impl From<EthereumLogFilter> for Vec<LogFilter> {
+    fn from(val: EthereumLogFilter) -> Self {
+        val.eth_get_logs_filters()
             .map(
                 |EthGetLogsFilter {
                      contracts,
@@ -326,8 +327,8 @@ impl EthereumLogFilter {
         // Start with the wildcard event filters.
         let mut filters = self
             .wildcard_events
-            .into_iter()
-            .map(|(event, _)| EthGetLogsFilter::from_event(event))
+            .into_keys()
+            .map(EthGetLogsFilter::from_event)
             .collect_vec();
 
         // The current algorithm is to repeatedly find the maximum cardinality vertex and turn all
@@ -637,12 +638,9 @@ impl EthereumBlockFilter {
                 filter_opt.extend(Self {
                     trigger_every_block: has_block_handler_without_filter,
                     contract_addresses: if has_block_handler_with_call_filter {
-                        vec![(
-                            data_source.start_block,
-                            data_source.address.unwrap().to_owned(),
-                        )]
-                        .into_iter()
-                        .collect()
+                        vec![(data_source.start_block, data_source.address.unwrap())]
+                            .into_iter()
+                            .collect()
                     } else {
                         HashSet::default()
                     },
@@ -726,7 +724,7 @@ impl From<ProviderStatus> for f64 {
 }
 
 const STATUS_HELP: &str = "0 = ok, 1 = net_version failed, 2 = get genesis failed, 3 = net_version timeout, 4 = get genesis timeout";
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ProviderEthRpcMetrics {
     request_duration: Box<HistogramVec>,
     errors: Box<CounterVec>,
@@ -734,7 +732,7 @@ pub struct ProviderEthRpcMetrics {
 }
 
 impl ProviderEthRpcMetrics {
-    pub fn new(registry: Arc<dyn MetricsRegistry>) -> Self {
+    pub fn new(registry: Arc<MetricsRegistry>) -> Self {
         let request_duration = registry
             .new_histogram_vec(
                 "eth_rpc_request_duration",
@@ -790,7 +788,7 @@ pub struct SubgraphEthRpcMetrics {
 }
 
 impl SubgraphEthRpcMetrics {
-    pub fn new(registry: Arc<dyn MetricsRegistry>, subgraph_hash: &str) -> Self {
+    pub fn new(registry: Arc<MetricsRegistry>, subgraph_hash: &str) -> Self {
         let request_duration = registry
             .global_gauge_vec(
                 "deployment_eth_rpc_request_duration",
@@ -831,8 +829,6 @@ impl SubgraphEthRpcMetrics {
 /// or a remote node over RPC.
 #[async_trait]
 pub trait EthereumAdapter: Send + Sync + 'static {
-    fn url_hostname(&self) -> &str;
-
     /// The `provider.label` from the adapter's configuration
     fn provider(&self) -> &str;
 

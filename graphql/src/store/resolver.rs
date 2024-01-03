@@ -2,21 +2,18 @@ use std::collections::BTreeMap;
 use std::result;
 use std::sync::Arc;
 
+use graph::components::store::*;
+use graph::data::graphql::{object, ObjectOrInterface};
 use graph::data::query::Trace;
-use graph::data::value::Object;
-use graph::data::{
-    graphql::{object, ObjectOrInterface},
-    schema::META_FIELD_TYPE,
-};
+use graph::data::value::{Object, Word};
 use graph::prelude::*;
-use graph::{components::store::*, data::schema::BLOCK_FIELD_TYPE};
+use graph::schema::{ast as sast, ApiSchema, META_FIELD_TYPE};
+use graph::schema::{ErrorPolicy, BLOCK_FIELD_TYPE};
 
 use crate::execution::ast as a;
 use crate::metrics::GraphQLMetrics;
+use crate::prelude::*;
 use crate::query::ext::BlockConstraint;
-use crate::schema::ast as sast;
-use crate::{prelude::*, schema::api::ErrorPolicy};
-
 use crate::store::query::collect_entities_from_query_field;
 
 /// A resolver that fetches entities from a `Store`.
@@ -241,12 +238,11 @@ impl StoreResolver {
             let number = self
                 .block_ptr
                 .as_ref()
-                .map(|ptr| r::Value::Int((ptr.ptr.number as i32).into()))
+                .map(|ptr| r::Value::Int(ptr.ptr.number.into()))
                 .unwrap_or(r::Value::Null);
 
             let timestamp = self.block_ptr.as_ref().map(|ptr| {
                 ptr.timestamp
-                    .clone()
                     .map(|ts| r::Value::Int(ts as i64))
                     .unwrap_or(r::Value::Null)
             });
@@ -332,9 +328,9 @@ impl Resolver for StoreResolver {
 
                 return Err(QueryExecutionError::AmbiguousDerivedFromResult(
                     field.position,
-                    field.name.to_owned(),
+                    field.name.clone(),
                     object_type.name().to_owned(),
-                    derived_from_field.name.to_owned(),
+                    derived_from_field.name.clone(),
                 ));
             } else {
                 Ok(children.into_iter().next().unwrap_or(r::Value::Null))
@@ -381,7 +377,9 @@ impl Resolver for StoreResolver {
                 let data = result.take_data();
                 let meta =
                     data.and_then(|mut d| d.remove("_meta").map(|m| ("_meta".to_string(), m)));
-                result.set_data(meta.map(|m| Object::from_iter(Some(m))));
+                result.set_data(
+                    meta.map(|(key, value)| Object::from_iter(Some((Word::from(key), value)))),
+                );
             }
             ErrorPolicy::Allow => (),
         }

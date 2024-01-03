@@ -269,6 +269,7 @@ where
         debug_fork: Option<DeploymentHash>,
         start_block_override: Option<BlockPtr>,
         graft_block_override: Option<BlockPtr>,
+        history_blocks: Option<i32>,
     ) -> Result<DeploymentLocator, SubgraphRegistrarError> {
         // We don't have a location for the subgraph yet; that will be
         // assigned when we deploy for real. For logging purposes, make up a
@@ -311,6 +312,7 @@ where
                     debug_fork,
                     self.version_switching_mode,
                     &self.resolver,
+                    history_blocks,
                 )
                 .await?
             }
@@ -328,6 +330,7 @@ where
                     debug_fork,
                     self.version_switching_mode,
                     &self.resolver,
+                    history_blocks,
                 )
                 .await?
             }
@@ -345,6 +348,7 @@ where
                     debug_fork,
                     self.version_switching_mode,
                     &self.resolver,
+                    history_blocks,
                 )
                 .await?
             }
@@ -362,6 +366,7 @@ where
                     debug_fork,
                     self.version_switching_mode,
                     &self.resolver,
+                    history_blocks,
                 )
                 .await?
             }
@@ -379,6 +384,7 @@ where
                     debug_fork,
                     self.version_switching_mode,
                     &self.resolver,
+                    history_blocks,
                 )
                 .await?
             }
@@ -411,21 +417,10 @@ where
         hash: &DeploymentHash,
         node_id: &NodeId,
     ) -> Result<(), SubgraphRegistrarError> {
-        let locations = self.store.locators(hash)?;
-        let deployment = match locations.len() {
-            0 => return Err(SubgraphRegistrarError::DeploymentNotFound(hash.to_string())),
-            1 => locations[0].clone(),
-            _ => {
-                return Err(SubgraphRegistrarError::StoreError(
-                    anyhow!(
-                        "there are {} different deployments with id {}",
-                        locations.len(),
-                        hash.as_str()
-                    )
-                    .into(),
-                ))
-            }
-        };
+        let locator = self.store.active_locator(hash)?;
+        let deployment =
+            locator.ok_or_else(|| SubgraphRegistrarError::DeploymentNotFound(hash.to_string()))?;
+
         self.store.reassign_subgraph(&deployment, node_id)?;
 
         Ok(())
@@ -437,7 +432,7 @@ async fn handle_assignment_event(
     provider: Arc<impl SubgraphAssignmentProviderTrait>,
     logger: Logger,
 ) -> Result<(), CancelableError<SubgraphAssignmentProviderError>> {
-    let logger = logger.to_owned();
+    let logger = logger.clone();
 
     debug!(logger, "Received assignment event: {:?}", event);
 
@@ -552,6 +547,7 @@ async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
     debug_fork: Option<DeploymentHash>,
     version_switching_mode: SubgraphVersionSwitchingMode,
     resolver: &Arc<dyn LinkResolver>,
+    history_blocks: Option<i32>,
 ) -> Result<DeploymentLocator, SubgraphRegistrarError> {
     let raw_string = serde_yaml::to_string(&raw).unwrap();
     let unvalidated = UnvalidatedSubgraphManifest::<C>::resolve(
@@ -637,10 +633,13 @@ async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
 
     // Apply the subgraph versioning and deployment operations,
     // creating a new subgraph deployment if one doesn't exist.
-    let deployment = DeploymentCreate::new(raw_string, &manifest, start_block)
+    let mut deployment = DeploymentCreate::new(raw_string, &manifest, start_block)
         .graft(base_block)
         .debug(debug_fork)
         .entities_with_causality_region(needs_causality_region);
+    if let Some(history_blocks) = history_blocks {
+        deployment = deployment.with_history_blocks(history_blocks);
+    }
 
     deployment_store
         .create_subgraph_deployment(

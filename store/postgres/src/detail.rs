@@ -315,7 +315,7 @@ pub(crate) fn deployment_statuses(
     details_with_fatal_error
         .into_iter()
         .map(|(detail, fatal)| {
-            let non_fatal = non_fatal_errors.remove(&detail.id).unwrap_or(vec![]);
+            let non_fatal = non_fatal_errors.remove(&detail.id).unwrap_or_default();
             info_from_details(detail, fatal, non_fatal, sites)
         })
         .collect()
@@ -340,6 +340,8 @@ struct StoredSubgraphManifest {
     start_block_hash: Option<Bytes>,
     raw_yaml: Option<String>,
     entities_with_causality_region: Vec<EntityType>,
+    on_sync: Option<String>,
+    history_blocks: i32,
 }
 
 impl From<StoredSubgraphManifest> for SubgraphManifestEntity {
@@ -352,6 +354,7 @@ impl From<StoredSubgraphManifest> for SubgraphManifestEntity {
             schema: value.schema,
             raw_yaml: value.raw_yaml,
             entities_with_causality_region: value.entities_with_causality_region,
+            history_blocks: value.history_blocks,
         }
     }
 }

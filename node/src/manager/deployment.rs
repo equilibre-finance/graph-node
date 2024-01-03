@@ -31,6 +31,7 @@ lazy_static! {
 pub enum DeploymentSearch {
     Name { name: String },
     Hash { hash: String, shard: Option<String> },
+    All,
     Deployment { namespace: String },
 }
 
@@ -42,6 +43,7 @@ impl fmt::Display for DeploymentSearch {
                 hash,
                 shard: Some(shard),
             } => write!(f, "{}:{}", hash, shard),
+            DeploymentSearch::All => Ok(()),
             DeploymentSearch::Hash { hash, shard: None } => write!(f, "{}", hash),
             DeploymentSearch::Deployment { namespace } => write!(f, "{}", namespace),
         }
@@ -115,6 +117,7 @@ impl DeploymentSearch {
             DeploymentSearch::Deployment { namespace } => {
                 query.filter(ds::name.eq(&namespace)).load(conn)?
             }
+            DeploymentSearch::All => query.load(conn)?,
         };
         Ok(deployments)
     }
@@ -196,7 +199,13 @@ impl Deployment {
             "node_id",
         ];
         if !statuses.is_empty() {
-            rows.extend(vec!["synced", "health", "latest block", "chain head block"]);
+            rows.extend(vec![
+                "synced",
+                "health",
+                "earliest block",
+                "latest block",
+                "chain head block",
+            ]);
         }
 
         let mut list = List::new(rows);
@@ -221,6 +230,7 @@ impl Deployment {
                 rows.extend(vec![
                     status.synced.to_string(),
                     status.health.as_str().to_string(),
+                    chain.earliest_block_number.to_string(),
                     chain
                         .latest_block
                         .as_ref()

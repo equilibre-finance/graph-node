@@ -8,32 +8,27 @@ use graph::data::value::{Object, Word};
 use graph::prelude::{r, CacheWeight, CheapClone};
 use graph::slog::warn;
 use graph::util::cache_weight;
-use lazy_static::lazy_static;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::Instant;
 
+use graph::schema::{ast as sast, ApiSchema};
 use graph::{components::store::EntityType, data::graphql::*};
 use graph::{
     data::graphql::ext::DirectiveFinder,
     prelude::{
-        s, ApiSchema, AttributeNames, ChildMultiplicity, EntityCollection, EntityFilter,
-        EntityLink, EntityOrder, EntityWindow, ParentLink, QueryExecutionError, StoreError,
+        s, AttributeNames, ChildMultiplicity, EntityCollection, EntityFilter, EntityLink,
+        EntityOrder, EntityWindow, ParentLink, QueryExecutionError, StoreError,
         Value as StoreValue, WindowAttribute, ENV_VARS,
     },
 };
 
 use crate::execution::{ast as a, ExecutionContext, Resolver};
 use crate::metrics::GraphQLMetrics;
-use crate::schema::ast as sast;
 use crate::store::query::build_query;
 use crate::store::StoreResolver;
 
-lazy_static! {
-    static ref ARG_FIRST: String = String::from("first");
-    static ref ARG_SKIP: String = String::from("skip");
-    static ref ARG_ID: String = String::from("id");
-}
+pub const ARG_ID: &str = "id";
 
 /// Intermediate data structure to hold the results of prefetching entities
 /// and their nested associations. For each association of `entity`, `children`
@@ -45,7 +40,7 @@ struct Node {
     /// the keys and values of the `children` map, but not of the map itself
     children_weight: usize,
 
-    entity: BTreeMap<Word, r::Value>,
+    entity: Object,
     /// We are using an `Rc` here for two reasons: it allows us to defer
     /// copying objects until the end, when converting to `q::Value` forces
     /// us to copy any child that is referenced by multiple parents. It also
@@ -89,8 +84,8 @@ struct Node {
     children: BTreeMap<Word, Vec<Rc<Node>>>,
 }
 
-impl From<BTreeMap<Word, r::Value>> for Node {
-    fn from(entity: BTreeMap<Word, r::Value>) -> Self {
+impl From<Object> for Node {
+    fn from(entity: Object) -> Self {
         Node {
             children_weight: entity.weight(),
             entity,
@@ -135,7 +130,7 @@ fn is_root_node<'a>(mut nodes: impl Iterator<Item = &'a Node>) -> bool {
 }
 
 fn make_root_node() -> Vec<Node> {
-    let entity = BTreeMap::new();
+    let entity = Object::empty();
     vec![Node {
         children_weight: entity.weight(),
         entity,
@@ -150,13 +145,14 @@ fn make_root_node() -> Vec<Node> {
 impl From<Node> for r::Value {
     fn from(node: Node) -> Self {
         let mut map = node.entity;
-        for (key, nodes) in node.children.into_iter() {
-            map.insert(
+        let entries = node.children.into_iter().map(|(key, nodes)| {
+            (
                 format!("prefetch:{}", key).into(),
                 node_list_as_value(nodes),
-            );
-        }
-        r::Value::object(map)
+            )
+        });
+        map.extend(entries);
+        r::Value::Object(map)
     }
 }
 
@@ -177,13 +173,13 @@ impl Node {
     fn id(&self) -> Result<String, Error> {
         match self.get("id") {
             None => Err(anyhow!("Entity is missing an `id` attribute")),
-            Some(r::Value::String(s)) => Ok(s.to_owned()),
+            Some(r::Value::String(s)) => Ok(s.clone()),
             _ => Err(anyhow!("Entity has non-string `id` attribute")),
         }
     }
 
     fn get(&self, key: &str) -> Option<&r::Value> {
-        self.entity.get(&key.into())
+        self.entity.get(key)
     }
 
     fn typename(&self) -> &str {
@@ -300,7 +296,7 @@ impl<'a> JoinCond<'a> {
                         let (ids, child_ids): (Vec<_>, Vec<_>) = parents_by_id
                             .into_iter()
                             .filter_map(|(id, node)| {
-                                node.get(*child_field)
+                                node.get(child_field)
                                     .and_then(|value| value.as_str())
                                     .map(|child_id| (id, child_id.to_owned()))
                             })
@@ -315,7 +311,7 @@ impl<'a> JoinCond<'a> {
                         let (ids, child_ids): (Vec<_>, Vec<_>) = parents_by_id
                             .into_iter()
                             .filter_map(|(id, node)| {
-                                node.get(*child_field)
+                                node.get(child_field)
                                     .and_then(|value| match value {
                                         r::Value::List(values) => {
                                             let values: Vec<_> = values
@@ -442,7 +438,7 @@ impl<'a> Join<'a> {
                 parents_by_id.dedup_by(|(id1, _), (id2, _)| id1 == id2);
 
                 let (ids, link) = cond.entity_link(parents_by_id, multiplicity);
-                let child_type: EntityType = cond.child_type.to_owned();
+                let child_type: EntityType = cond.child_type.clone();
                 let column_names = match column_names_map.get(&child_type) {
                     Some(column_names) => column_names.clone(),
                     None => AttributeNames::All,
@@ -485,9 +481,12 @@ pub fn run(
     execute_root_selection_set(resolver, ctx, selection_set).map(|(nodes, trace)| {
         graphql_metrics.observe_query_result_size(nodes.weight());
         let obj = Object::from_iter(nodes.into_iter().flat_map(|node| {
-            node.children
-                .into_iter()
-                .map(|(key, nodes)| (format!("prefetch:{}", key), node_list_as_value(nodes)))
+            node.children.into_iter().map(|(key, nodes)| {
+                (
+                    Word::from(format!("prefetch:{}", key)),
+                    node_list_as_value(nodes),
+                )
+            })
         }));
         (r::Value::Object(obj), trace)
     })
@@ -685,9 +684,9 @@ fn fetch(
     }
 
     query.logger = Some(ctx.logger.cheap_clone());
-    if let Some(r::Value::String(id)) = field.argument_value(ARG_ID.as_str()) {
+    if let Some(r::Value::String(id)) = field.argument_value(ARG_ID) {
         query.filter = Some(
-            EntityFilter::Equal(ARG_ID.to_owned(), StoreValue::from(id.to_owned()))
+            EntityFilter::Equal(ARG_ID.to_owned(), StoreValue::from(id.clone()))
                 .and_maybe(query.filter),
         );
     }
@@ -704,12 +703,7 @@ fn fetch(
     resolver
         .store
         .find_query_values(query)
-        .map(|(values, trace)| {
-            (
-                values.into_iter().map(|entity| entity.into()).collect(),
-                trace,
-            )
-        })
+        .map(|(values, trace)| (values.into_iter().map(Node::from).collect(), trace))
 }
 
 #[derive(Debug, Default, Clone)]

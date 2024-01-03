@@ -1,0 +1,29 @@
+{
+  "name": "blocks",
+  "license": "MIT",
+  "repository": {
+    "url": "equilibre/subgraphs",
+    "directory": "subgraphs/blocks"
+  },
+  "files": [
+    "generated"
+  ],
+  "scripts": {
+    "codegen": "graph codegen --output-dir ./src/types/",
+    "build": "graph build",
+    "test": "graph test -r",
+    "local-create": "graph create --node http://127.0.0.1:8020/ equilibre/blocks",
+    "local-remove": "graph remove --node http://127.0.0.1:8020/ equilibre/blocks",
+    "local-deploy": "graph deploy --node http://127.0.0.1:8020/ --ipfs http://localhost:5001 equilibre/blocks"
+  },
+  "devDependencies": {
+    "@graphprotocol/graph-cli": "^0.27.0",
+    "@graphprotocol/graph-ts": "^0.24.1",
+    "assemblyscript": "^0.19.20",
+    "matchstick-as": "0.5.0",
+    "wabt": "1.0.24"
+  },
+  "dependencies": {
+    "mustache": "^4.2.0"
+  }
+}

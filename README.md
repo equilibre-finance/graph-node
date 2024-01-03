@@ -19,6 +19,7 @@ To build and run this project you need to have the following installed on your s
   - Note that `rustfmt`, which is part of the default Rust installation, is a build-time requirement.
 - PostgreSQL – [PostgreSQL Downloads](https://www.postgresql.org/download/)
 - IPFS – [Installing IPFS](https://docs.ipfs.io/install/)
+- Profobuf Compiler - [Installing Protobuf](https://grpc.io/docs/protoc-installation/)
 
 For Ethereum network data, you can either run your own Ethereum node or use an Ethereum node provider of your choice.
 
@@ -57,7 +58,7 @@ the connection string, check the [Postgres
 documentation](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING).
 `graph-node` uses a few Postgres extensions. If the Postgres user with which
 you run `graph-node` is a superuser, `graph-node` will enable these
-extensions when it initalizes the database. If the Postgres user is not a
+extensions when it initializes the database. If the Postgres user is not a
 superuser, you will need to create the extensions manually since only
 superusers are allowed to do that. To create them you need to connect as a
 superuser, which in many installations is the `postgres` user:

@@ -335,7 +335,7 @@ pub struct Site {
     /// Whether this is the site that should be used for queries. There's
     /// exactly one for each `deployment`, i.e., other entries for that
     /// deployment have `active = false`
-    pub(crate) active: bool,
+    pub active: bool,
 
     pub(crate) schema_version: DeploymentSchemaVersion,
     /// Only the store and tests can create Sites
@@ -367,6 +367,12 @@ impl TryFrom<Schema> for Site {
             schema_version,
             _creation_disallowed: (),
         })
+    }
+}
+
+impl std::fmt::Display for Site {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}[sgd{}]", self.deployment, self.id)
     }
 }
 
@@ -526,17 +532,15 @@ mod queries {
             } else {
                 ds::table.load::<Schema>(conn)?
             }
+        } else if only_active {
+            ds::table
+                .filter(ds::active)
+                .filter(ds::subgraph.eq_any(ids))
+                .load::<Schema>(conn)?
         } else {
-            if only_active {
-                ds::table
-                    .filter(ds::active)
-                    .filter(ds::subgraph.eq_any(ids))
-                    .load::<Schema>(conn)?
-            } else {
-                ds::table
-                    .filter(ds::subgraph.eq_any(ids))
-                    .load::<Schema>(conn)?
-            }
+            ds::table
+                .filter(ds::subgraph.eq_any(ids))
+                .load::<Schema>(conn)?
         };
         schemas
             .into_iter()
@@ -1273,7 +1277,7 @@ impl<'a> Connection<'a> {
         // Any shards that have no deployments in them will not be in
         // 'used'; add them in with a count of 0
         let missing = shards
-            .into_iter()
+            .iter()
             .filter(|shard| !used.iter().any(|(s, _)| s == shard.as_str()))
             .map(|shard| (shard.as_str(), 0));
 
@@ -1406,7 +1410,7 @@ impl<'a> Connection<'a> {
                 detail.latest_ethereum_block_number.clone(),
             )?
             .map(|b| b.to_ptr())
-            .map(|ptr| (Some(Vec::from(ptr.hash_slice())), Some(ptr.number as i32)))
+            .map(|ptr| (Some(Vec::from(ptr.hash_slice())), Some(ptr.number)))
             .unwrap_or((None, None));
             let entity_count = detail.entity_count.to_u64().unwrap_or(0) as i32;
 
@@ -1557,13 +1561,22 @@ impl Mirror {
             .expect("we always have a primary pool")
             .clone();
         let pools = pools
-            .into_iter()
+            .iter()
             .filter(|(shard, _)| *shard != &*PRIMARY_SHARD)
             .fold(vec![primary], |mut pools, (_, pool)| {
                 pools.push(pool.clone());
                 pools
             });
         Mirror { pools }
+    }
+
+    /// Create a mirror that only uses the primary. Such a mirror will not
+    /// be able to do anything if the primary is down, and should only be
+    /// used for non-critical uses like command line tools
+    pub fn primary_only(primary: ConnectionPool) -> Mirror {
+        Mirror {
+            pools: vec![primary],
+        }
     }
 
     /// Execute the function `f` with connections from each of our pools in
@@ -1659,7 +1672,7 @@ impl Mirror {
         for table_name in PUBLIC_TABLES {
             copy_table(
                 conn,
-                &*ForeignServer::PRIMARY_PUBLIC,
+                ForeignServer::PRIMARY_PUBLIC,
                 NAMESPACE_PUBLIC,
                 table_name,
             )?;
@@ -1668,7 +1681,7 @@ impl Mirror {
 
         // Repopulate `SUBGRAPHS_TABLES` but only copy the data we actually
         // need to respond to queries when the primary is down
-        let src_nsp = ForeignServer::metadata_schema(&*PRIMARY_SHARD);
+        let src_nsp = ForeignServer::metadata_schema(&PRIMARY_SHARD);
         let dst_nsp = NAMESPACE_SUBGRAPHS;
 
         run_query(

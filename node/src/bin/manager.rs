@@ -1,17 +1,19 @@
 use clap::{Parser, Subcommand};
 use config::PoolSize;
 use git_testament::{git_testament, render_testament};
+use graph::bail;
+use graph::endpoint::EndpointMetrics;
+use graph::log::logger_with_levels;
+use graph::prelude::{MetricsRegistry, BLOCK_NUMBER_MAX};
 use graph::{data::graphql::effort::LoadManager, prelude::chrono, prometheus::Registry};
 use graph::{
-    log::logger,
     prelude::{
         anyhow::{self, Context as AnyhowContextTrait},
-        info, o, slog, tokio, Logger, NodeId, ENV_VARS,
+        info, tokio, Logger, NodeId,
     },
     url::Url,
 };
 use graph_chain_ethereum::{EthereumAdapter, EthereumNetworks};
-use graph_core::MetricsRegistry;
 use graph_graphql::prelude::GraphQlRunner;
 use graph_node::config::{self, Config as Cfg};
 use graph_node::manager::color::Terminal;
@@ -46,6 +48,13 @@ lazy_static! {
     version = RENDERED_TESTAMENT.as_str()
 )]
 pub struct Opt {
+    #[clap(
+        long,
+        default_value = "off",
+        env = "GRAPHMAN_LOG",
+        help = "level for log output in slog format"
+    )]
+    pub log_level: String,
     #[clap(
         long,
         default_value = "auto",
@@ -104,7 +113,10 @@ pub enum Command {
     /// the shard by adding `:shard` to the IPFS hash.
     Info {
         /// The deployment (see above)
-        deployment: DeploymentSearch,
+        deployment: Option<DeploymentSearch>,
+        /// List all the deployments in the graph-node
+        #[clap(long, short)]
+        all: bool,
         /// List only current version
         #[clap(long, short)]
         current: bool,
@@ -152,6 +164,9 @@ pub enum Command {
         /// database
         #[clap(long, short)]
         force: bool,
+        /// Rewind to the start block of the subgraph
+        #[clap(long)]
+        start_block: bool,
         /// Sleep for this many seconds after pausing subgraphs
         #[clap(
             long,
@@ -161,10 +176,23 @@ pub enum Command {
         )]
         sleep: Duration,
         /// The block hash of the target block
-        block_hash: String,
+        #[clap(
+            required_unless_present = "start-block",
+            conflicts_with = "start-block",
+            long,
+            short = 'H'
+        )]
+        block_hash: Option<String>,
         /// The block number of the target block
-        block_number: i32,
+        #[clap(
+            required_unless_present = "start-block",
+            conflicts_with = "start-block",
+            long,
+            short = 'n'
+        )]
+        block_number: Option<i32>,
         /// The deployments to rewind (see `help info`)
+        #[clap(required = true, min_values = 1)]
         deployments: Vec<DeploymentSearch>,
     },
     /// Deploy and run an arbitrary subgraph up to a certain block
@@ -229,16 +257,33 @@ pub enum Command {
     #[clap(subcommand)]
     Index(IndexCommand),
 
-    /// Prune deployments
+    /// Prune a deployment
+    ///
+    /// Keep only entity versions that are needed to respond to queries at
+    /// block heights that are within `history` blocks of the subgraph head;
+    /// all other entity versions are removed.
+    ///
+    /// Unless `--once` is given, this setting is permanent and the subgraph
+    /// will periodically be pruned to remove history as the subgraph head
+    /// moves forward.
     Prune {
         /// The deployment to prune (see `help info`)
         deployment: DeploymentSearch,
-        /// Prune tables with a ratio of entities to entity versions lower than this
-        #[clap(long, short, default_value = "0.20")]
-        prune_ratio: f64,
+        /// Prune by rebuilding tables when removing more than this fraction
+        /// of history. Defaults to GRAPH_STORE_HISTORY_REBUILD_THRESHOLD
+        #[clap(long, short)]
+        rebuild_threshold: Option<f64>,
+        /// Prune by deleting when removing more than this fraction of
+        /// history but less than rebuild_threshold. Defaults to
+        /// GRAPH_STORE_HISTORY_DELETE_THRESHOLD
+        #[clap(long, short)]
+        delete_threshold: Option<f64>,
         /// How much history to keep in blocks
         #[clap(long, short = 'y', default_value = "10000")]
         history: usize,
+        /// Prune only this once
+        #[clap(long, short)]
+        once: bool,
     },
 
     /// General database management
@@ -366,6 +411,12 @@ pub enum CopyCommand {
         /// How far behind `src` subgraph head to copy
         #[clap(long, short, default_value = "200")]
         offset: u32,
+        /// Activate this copy once it has synced
+        #[clap(long, short, conflicts_with = "replace")]
+        activate: bool,
+        /// Replace the source with this copy once it has synced
+        #[clap(long, short, conflicts_with = "activate")]
+        replace: bool,
         /// The source deployment (see `help info`)
         src: DeploymentSearch,
         /// The name of the database shard into which to copy
@@ -449,14 +500,19 @@ pub enum ChainCommand {
 pub enum CallCacheCommand {
     /// Remove the call cache of the specified chain.
     ///
-    /// If block numbers are not mentioned in `--from` and `--to`, then all the call cache will be
-    /// removed.
+    /// Either remove entries in the range `--from` and `--to`, or remove
+    /// the entire cache with `--remove-entire-cache`. Removing the entire
+    /// cache can reduce indexing performance significantly and should
+    /// generally be avoided.
     Remove {
+        /// Remove the entire cache
+        #[clap(long, conflicts_with_all = &["from", "to"])]
+        remove_entire_cache: bool,
         /// Starting block number
-        #[clap(long, short)]
+        #[clap(long, short, conflicts_with = "remove-entire-cache", requires = "to")]
         from: Option<i32>,
         /// Ending block number
-        #[clap(long, short)]
+        #[clap(long, short, conflicts_with = "remove-entire-cache", requires = "from")]
         to: Option<i32>,
     },
 }
@@ -766,7 +822,7 @@ impl Context {
 
         Arc::new(SubscriptionManager::new(
             self.logger.clone(),
-            primary.connection.to_owned(),
+            primary.connection.clone(),
             self.registry.clone(),
         ))
     }
@@ -805,7 +861,7 @@ impl Context {
             &self.node_id,
             &self.config,
             self.fork_base,
-            self.registry,
+            self.registry.clone(),
         );
 
         for pool in pools.values() {
@@ -818,6 +874,7 @@ impl Context {
             subgraph_store,
             HashMap::default(),
             vec![],
+            self.registry,
         );
 
         (store, pools)
@@ -857,7 +914,8 @@ impl Context {
     async fn ethereum_networks(&self) -> anyhow::Result<EthereumNetworks> {
         let logger = self.logger.clone();
         let registry = self.metrics_registry();
-        create_all_ethereum_networks(logger, registry, &self.config).await
+        let metrics = Arc::new(EndpointMetrics::mock());
+        create_all_ethereum_networks(logger, registry, &self.config, metrics).await
     }
 
     fn chain_store(self, chain_name: &str) -> anyhow::Result<Arc<ChainStore>> {
@@ -894,10 +952,7 @@ async fn main() -> anyhow::Result<()> {
 
     let version_label = opt.version_label.clone();
     // Set up logger
-    let logger = match ENV_VARS.log_levels {
-        Some(_) => logger(false),
-        None => Logger::root(slog::Discard, o!()),
-    };
+    let logger = logger_with_levels(false, Some(&opt.log_level));
 
     // Log version information
     info!(
@@ -966,6 +1021,7 @@ async fn main() -> anyhow::Result<()> {
             pending,
             status,
             used,
+            all,
         } => {
             let (primary, store) = if status {
                 let (store, primary) = ctx.store_and_primary();
@@ -973,7 +1029,22 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 (ctx.primary_pool(), None)
             };
-            commands::info::run(primary, store, deployment, current, pending, used)
+
+            match deployment {
+                Some(deployment) => {
+                    commands::info::run(primary, store, deployment, current, pending, used).err();
+                }
+                None => {
+                    if all {
+                        let deployment = DeploymentSearch::All;
+                        commands::info::run(primary, store, deployment, current, pending, used)
+                            .err();
+                    } else {
+                        bail!("Please specify a deployment or use --all to list all deployments");
+                    }
+                }
+            };
+            Ok(())
         }
         Unused(cmd) => {
             let store = ctx.subgraph_store();
@@ -1026,6 +1097,7 @@ async fn main() -> anyhow::Result<()> {
             block_hash,
             block_number,
             deployments,
+            start_block,
         } => {
             let (store, primary) = ctx.store_and_primary();
             commands::rewind::run(
@@ -1036,6 +1108,7 @@ async fn main() -> anyhow::Result<()> {
                 block_number,
                 force,
                 sleep,
+                start_block,
             )
             .await
         }
@@ -1093,10 +1166,15 @@ async fn main() -> anyhow::Result<()> {
                     shard,
                     node,
                     offset,
+                    activate,
+                    replace,
                 } => {
                     let shards: Vec<_> = ctx.config.stores.keys().cloned().collect();
                     let (store, primary) = ctx.store_and_primary();
-                    commands::copy::create(store, primary, src, shard, shards, node, offset).await
+                    commands::copy::create(
+                        store, primary, src, shard, shards, node, offset, activate, replace,
+                    )
+                    .await
                 }
                 Activate { deployment, shard } => {
                     commands::copy::activate(ctx.subgraph_store(), deployment, shard)
@@ -1176,12 +1254,27 @@ async fn main() -> anyhow::Result<()> {
                     let chain_store = ctx.chain_store(&chain_name)?;
                     truncate(chain_store, force)
                 }
-                CallCache { method, chain_name } => match method {
-                    CallCacheCommand::Remove { from, to } => {
-                        let chain_store = ctx.chain_store(&chain_name)?;
-                        commands::chain::clear_call_cache(chain_store, from, to).await
+                CallCache { method, chain_name } => {
+                    match method {
+                        CallCacheCommand::Remove {
+                            from,
+                            to,
+                            remove_entire_cache,
+                        } => {
+                            let chain_store = ctx.chain_store(&chain_name)?;
+                            if !remove_entire_cache && from.is_none() && to.is_none() {
+                                bail!("you must specify either --from and --to or --remove-entire-cache");
+                            }
+                            let (from, to) = if remove_entire_cache {
+                                (0, BLOCK_NUMBER_MAX)
+                            } else {
+                                // Clap makes sure that this does not panic
+                                (from.unwrap(), to.unwrap())
+                            };
+                            commands::chain::clear_call_cache(chain_store, from, to).await
+                        }
                     }
-                },
+                }
             }
         }
         Stats(cmd) => {
@@ -1315,10 +1408,21 @@ async fn main() -> anyhow::Result<()> {
         Prune {
             deployment,
             history,
-            prune_ratio,
+            rebuild_threshold,
+            delete_threshold,
+            once,
         } => {
             let (store, primary_pool) = ctx.store_and_primary();
-            commands::prune::run(store, primary_pool, deployment, history, prune_ratio).await
+            commands::prune::run(
+                store,
+                primary_pool,
+                deployment,
+                history,
+                rebuild_threshold,
+                delete_threshold,
+                once,
+            )
+            .await
         }
         Drop {
             deployment,

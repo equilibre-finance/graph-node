@@ -80,11 +80,7 @@ impl QueryResults {
     }
 
     pub fn errors(&self) -> Vec<QueryError> {
-        self.results
-            .iter()
-            .map(|r| r.errors.clone())
-            .flatten()
-            .collect()
+        self.results.iter().flat_map(|r| r.errors.clone()).collect()
     }
 }
 
@@ -375,7 +371,10 @@ fn multiple_data_items() {
     use serde_json::json;
 
     fn make_obj(key: &str, value: &str) -> Arc<QueryResult> {
-        let obj = Object::from_iter([(key.to_owned(), r::Value::String(value.to_owned()))]);
+        let obj = Object::from_iter([(
+            crate::data::value::Word::from(key),
+            r::Value::String(value.to_owned()),
+        )]);
         Arc::new(obj.into())
     }
 

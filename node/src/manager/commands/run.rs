@@ -13,14 +13,17 @@ use crate::MetricsContext;
 use ethereum::chain::{EthereumAdapterSelector, EthereumBlockRefetcher, EthereumStreamBuilder};
 use ethereum::{ProviderEthRpcMetrics, RuntimeAdapter as EthereumRuntimeAdapter};
 use graph::anyhow::{bail, format_err};
+use graph::blockchain::client::ChainClient;
 use graph::blockchain::{BlockchainKind, BlockchainMap};
 use graph::cheap_clone::CheapClone;
 use graph::components::store::{BlockStore as _, DeploymentLocator};
+use graph::endpoint::EndpointMetrics;
 use graph::env::EnvVars;
 use graph::firehose::FirehoseEndpoints;
 use graph::prelude::{
     anyhow, tokio, BlockNumber, DeploymentHash, LoggerFactory, NodeId, SubgraphAssignmentProvider,
-    SubgraphName, SubgraphRegistrar, SubgraphStore, SubgraphVersionSwitchingMode, ENV_VARS,
+    SubgraphCountMetric, SubgraphName, SubgraphRegistrar, SubgraphStore,
+    SubgraphVersionSwitchingMode, ENV_VARS,
 };
 use graph::slog::{debug, info, Logger};
 use graph_chain_ethereum as ethereum;
@@ -31,7 +34,7 @@ use graph_core::{
 };
 
 fn locate(store: &dyn SubgraphStore, hash: &str) -> Result<DeploymentLocator, anyhow::Error> {
-    let mut locators = store.locators(&hash)?;
+    let mut locators = store.locators(hash)?;
     match locators.len() {
         0 => bail!("could not find subgraph {hash} we just created"),
         1 => Ok(locators.pop().unwrap()),
@@ -69,20 +72,32 @@ pub async fn run(
         env_vars.mappings.ipfs_request_limit,
     );
 
+    let endpoint_metrics = Arc::new(EndpointMetrics::new(
+        logger.clone(),
+        &config.chains.providers(),
+        metrics_registry.cheap_clone(),
+    ));
+
     // Convert the clients into a link resolver. Since we want to get past
     // possible temporary DNS failures, make the resolver retry
     let link_resolver = Arc::new(LinkResolver::new(ipfs_clients, env_vars.cheap_clone()));
 
     let eth_rpc_metrics = Arc::new(ProviderEthRpcMetrics::new(metrics_registry.clone()));
-    let eth_networks =
-        create_ethereum_networks_for_chain(&logger, eth_rpc_metrics, &config, &network_name)
-            .await
-            .expect("Failed to parse Ethereum networks");
-    let firehose_networks_by_kind = create_firehose_networks(logger.clone(), &config);
+    let eth_networks = create_ethereum_networks_for_chain(
+        &logger,
+        eth_rpc_metrics,
+        &config,
+        &network_name,
+        endpoint_metrics.cheap_clone(),
+    )
+    .await
+    .expect("Failed to parse Ethereum networks");
+    let firehose_networks_by_kind =
+        create_firehose_networks(logger.clone(), &config, endpoint_metrics);
     let firehose_networks = firehose_networks_by_kind.get(&BlockchainKind::Ethereum);
     let firehose_endpoints = firehose_networks
         .and_then(|v| v.networks.get(&network_name))
-        .map_or_else(|| FirehoseEndpoints::new(), |v| v.clone());
+        .map_or_else(FirehoseEndpoints::new, |v| v.clone());
 
     let eth_adapters = match eth_networks.networks.get(&network_name) {
         Some(adapters) => adapters.clone(),
@@ -112,7 +127,9 @@ pub async fn run(
     let chain_store = network_store
         .block_store()
         .chain_store(network_name.as_ref())
-        .expect(format!("No chain store for {}", &network_name).as_ref());
+        .unwrap_or_else(|| panic!("No chain store for {}", &network_name));
+
+    let client = Arc::new(ChainClient::new(firehose_endpoints, eth_adapters));
 
     let chain = ethereum::Chain::new(
         logger_factory.clone(),
@@ -121,23 +138,23 @@ pub async fn run(
         metrics_registry.clone(),
         chain_store.cheap_clone(),
         chain_store.cheap_clone(),
-        firehose_endpoints.clone(),
-        eth_adapters.clone(),
+        client.clone(),
         chain_head_update_listener,
         Arc::new(EthereumStreamBuilder {}),
         Arc::new(EthereumBlockRefetcher {}),
         Arc::new(EthereumAdapterSelector::new(
             logger_factory.clone(),
-            Arc::new(eth_adapters),
-            Arc::new(firehose_endpoints.clone()),
+            client,
             metrics_registry.clone(),
             chain_store.cheap_clone(),
         )),
         Arc::new(EthereumRuntimeAdapter {
             call_cache: chain_store.cheap_clone(),
             eth_adapters: Arc::new(eth_adapters2),
+            chain_identifier: Arc::new(chain_store.chain_identifier.clone()),
         }),
-        ethereum::ENV_VARS.reorg_threshold,
+        graph::env::ENV_VARS.reorg_threshold,
+        ethereum::ENV_VARS.ingestor_polling_interval,
         // We assume the tested chain is always ingestible for now
         true,
     );
@@ -147,12 +164,15 @@ pub async fn run(
 
     let static_filters = ENV_VARS.experimental_static_filters;
 
+    let sg_metrics = Arc::new(SubgraphCountMetric::new(metrics_registry.clone()));
+
     let blockchain_map = Arc::new(blockchain_map);
     let subgraph_instance_manager = SubgraphInstanceManager::new(
         &logger_factory,
         env_vars.cheap_clone(),
         subgraph_store.clone(),
         blockchain_map.clone(),
+        sg_metrics.cheap_clone(),
         metrics_registry.clone(),
         link_resolver.cheap_clone(),
         ipfs_service,
@@ -164,6 +184,7 @@ pub async fn run(
         &logger_factory,
         link_resolver.cheap_clone(),
         subgraph_instance_manager,
+        sg_metrics,
     ));
 
     let panicking_subscription_manager = Arc::new(PanicSubscriptionManager {});
@@ -209,6 +230,7 @@ pub async fn run(
         subgraph_name.clone(),
         subgraph_hash.clone(),
         node_id.clone(),
+        None,
         None,
         None,
         None,

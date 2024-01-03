@@ -1,8 +1,15 @@
-use graph::blockchain::{Block, BlockchainKind, EmptyNodeCapabilities};
+use graph::anyhow;
+use graph::blockchain::client::ChainClient;
+use graph::blockchain::firehose_block_ingestor::FirehoseBlockIngestor;
+use graph::blockchain::{
+    BasicBlockchainBuilder, Block, BlockIngestor, BlockchainBuilder, BlockchainKind,
+    EmptyNodeCapabilities, NoopRuntimeAdapter,
+};
 use graph::cheap_clone::CheapClone;
+use graph::components::store::DeploymentCursorTracker;
 use graph::data::subgraph::UnifiedMappingApiVersion;
-use graph::firehose::{FirehoseEndpoint, FirehoseEndpoints};
-use graph::prelude::{MetricsRegistry, TryFutureExt};
+use graph::firehose::FirehoseEndpoint;
+use graph::prelude::MetricsRegistry;
 use graph::{
     blockchain::{
         block_stream::{
@@ -21,7 +28,6 @@ use std::sync::Arc;
 
 use crate::adapter::TriggerFilter;
 use crate::data_source::{DataSourceTemplate, UnresolvedDataSourceTemplate};
-use crate::runtime::RuntimeAdapter;
 use crate::trigger::{self, ArweaveTrigger};
 use crate::{
     codec,
@@ -32,9 +38,9 @@ use graph::blockchain::block_stream::{BlockStream, FirehoseCursor};
 pub struct Chain {
     logger_factory: LoggerFactory,
     name: String,
-    firehose_endpoints: Arc<FirehoseEndpoints>,
+    client: Arc<ChainClient<Self>>,
     chain_store: Arc<dyn ChainStore>,
-    metrics_registry: Arc<dyn MetricsRegistry>,
+    metrics_registry: Arc<MetricsRegistry>,
 }
 
 impl std::fmt::Debug for Chain {
@@ -43,20 +49,14 @@ impl std::fmt::Debug for Chain {
     }
 }
 
-impl Chain {
-    pub fn new(
-        logger_factory: LoggerFactory,
-        name: String,
-        chain_store: Arc<dyn ChainStore>,
-        firehose_endpoints: FirehoseEndpoints,
-        metrics_registry: Arc<dyn MetricsRegistry>,
-    ) -> Self {
+impl BlockchainBuilder<Chain> for BasicBlockchainBuilder {
+    fn build(self) -> Chain {
         Chain {
-            logger_factory,
-            name,
-            firehose_endpoints: Arc::new(firehose_endpoints),
-            chain_store,
-            metrics_registry,
+            logger_factory: self.logger_factory,
+            name: self.name,
+            client: Arc::new(ChainClient::<Chain>::new_firehose(self.firehose_endpoints)),
+            chain_store: self.chain_store,
+            metrics_registry: self.metrics_registry,
         }
     }
 }
@@ -65,6 +65,7 @@ impl Chain {
 impl Blockchain for Chain {
     const KIND: BlockchainKind = BlockchainKind::Arweave;
 
+    type Client = ();
     type Block = codec::Block;
 
     type DataSource = DataSource;
@@ -105,12 +106,11 @@ impl Blockchain for Chain {
         unimplemented!("This chain does not support Dynamic Data Sources. is_refetch_block_required always returns false, this shouldn't be called.")
     }
 
-    async fn new_firehose_block_stream(
+    async fn new_block_stream(
         &self,
         deployment: DeploymentLocator,
-        block_cursor: FirehoseCursor,
+        store: impl DeploymentCursorTracker,
         start_blocks: Vec<BlockNumber>,
-        subgraph_current_block: Option<BlockPtr>,
         filter: Arc<Self::TriggerFilter>,
         unified_api_version: UnifiedMappingApiVersion,
     ) -> Result<Box<dyn BlockStream<Self>>, Error> {
@@ -122,7 +122,6 @@ impl Blockchain for Chain {
             )
             .unwrap_or_else(|_| panic!("no adapter for network {}", self.name));
 
-        let firehose_endpoint = self.firehose_endpoints.random()?;
         let logger = self
             .logger_factory
             .subgraph_logger(&deployment)
@@ -132,9 +131,9 @@ impl Blockchain for Chain {
 
         Ok(Box::new(FirehoseBlockStream::new(
             deployment.hash,
-            firehose_endpoint,
-            subgraph_current_block,
-            block_cursor,
+            self.chain_client(),
+            store.block_ptr(),
+            store.firehose_cursor(),
             firehose_mapper,
             adapter,
             filter,
@@ -142,17 +141,6 @@ impl Blockchain for Chain {
             logger,
             self.metrics_registry.clone(),
         )))
-    }
-
-    async fn new_polling_block_stream(
-        &self,
-        _deployment: DeploymentLocator,
-        _start_blocks: Vec<BlockNumber>,
-        _subgraph_current_block: Option<BlockPtr>,
-        _filter: Arc<Self::TriggerFilter>,
-        _unified_api_version: UnifiedMappingApiVersion,
-    ) -> Result<Box<dyn BlockStream<Self>>, Error> {
-        panic!("Arweave does not support polling block stream")
     }
 
     fn chain_store(&self) -> Arc<dyn ChainStore> {
@@ -164,19 +152,30 @@ impl Blockchain for Chain {
         logger: &Logger,
         number: BlockNumber,
     ) -> Result<BlockPtr, IngestorError> {
-        self.firehose_endpoints
-            .random()?
+        self.client
+            .firehose_endpoint()?
             .block_ptr_for_number::<codec::Block>(logger, number)
-            .map_err(Into::into)
             .await
+            .map_err(Into::into)
     }
 
     fn runtime_adapter(&self) -> Arc<dyn RuntimeAdapterTrait<Self>> {
-        Arc::new(RuntimeAdapter {})
+        Arc::new(NoopRuntimeAdapter::default())
     }
 
-    fn is_firehose_supported(&self) -> bool {
-        true
+    fn chain_client(&self) -> Arc<ChainClient<Self>> {
+        self.client.clone()
+    }
+
+    fn block_ingestor(&self) -> anyhow::Result<Box<dyn BlockIngestor>> {
+        let ingestor = FirehoseBlockIngestor::<crate::Block, Self>::new(
+            self.chain_store.cheap_clone(),
+            self.chain_client(),
+            self.logger_factory
+                .component_logger("ArweaveFirehoseBlockIngestor", None),
+            self.name.clone(),
+        );
+        Ok(Box::new(ingestor))
     }
 }
 

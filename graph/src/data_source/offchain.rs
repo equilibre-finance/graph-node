@@ -154,7 +154,7 @@ impl DataSource {
             .context
             .as_ref()
             .as_ref()
-            .map(|ctx| serde_json::to_value(&ctx).unwrap());
+            .map(|ctx| serde_json::to_value(ctx).unwrap());
 
         StoredDynamicDataSource {
             manifest_idx: self.manifest_idx,
@@ -353,14 +353,18 @@ impl UnresolvedDataSourceTemplate {
         logger: &Logger,
         manifest_idx: u32,
     ) -> Result<DataSourceTemplate, Error> {
-        info!(logger, "Resolve data source template"; "name" => &self.name);
+        let mapping = self
+            .mapping
+            .resolve(resolver, logger)
+            .await
+            .with_context(|| format!("failed to resolve data source template {}", self.name))?;
 
         Ok(DataSourceTemplate {
             kind: self.kind,
             network: self.network,
             name: self.name,
             manifest_idx,
-            mapping: self.mapping.resolve(resolver, logger).await?,
+            mapping,
         })
     }
 }

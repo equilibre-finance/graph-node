@@ -5,16 +5,22 @@ use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, PooledConnection};
 use graph::anyhow::Context;
 use graph::blockchain::block_stream::FirehoseCursor;
-use graph::components::store::{EntityKey, EntityType, PruneReporter, StoredDynamicDataSource};
+use graph::components::store::{
+    DerivedEntityQuery, EntityKey, EntityType, PrunePhase, PruneReporter, PruneRequest,
+    PruningStrategy, StoredDynamicDataSource, VersionStats,
+};
 use graph::components::versions::VERSIONS;
 use graph::data::query::Trace;
 use graph::data::subgraph::{status, SPEC_VERSION_0_0_6};
 use graph::data_source::CausalityRegion;
+use graph::prelude::futures03::FutureExt;
 use graph::prelude::{
     tokio, ApiVersion, CancelHandle, CancelToken, CancelableError, EntityOperation, PoolWaitStats,
     SubgraphDeploymentEntity,
 };
 use graph::semver::Version;
+use graph::tokio::task::JoinHandle;
+use itertools::Itertools;
 use lru_time_cache::LruCache;
 use rand::{seq::SliceRandom, thread_rng};
 use std::borrow::Cow;
@@ -25,29 +31,29 @@ use std::ops::Bound;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::{atomic::AtomicUsize, Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use graph::components::store::EntityCollection;
 use graph::components::subgraph::{ProofOfIndexingFinisher, ProofOfIndexingVersion};
 use graph::constraint_violation;
-use graph::data::subgraph::schema::{DeploymentCreate, SubgraphError, POI_OBJECT};
+use graph::data::subgraph::schema::{DeploymentCreate, SubgraphError, POI_DIGEST, POI_OBJECT};
 use graph::prelude::{
-    anyhow, debug, info, o, warn, web3, ApiSchema, AttributeNames, BlockNumber, BlockPtr,
-    CheapClone, DeploymentHash, DeploymentState, Entity, EntityModification, EntityQuery, Error,
-    Logger, QueryExecutionError, Schema, StopwatchMetrics, StoreError, StoreEvent, UnfailOutcome,
-    Value, ENV_VARS,
+    anyhow, debug, info, o, warn, web3, AttributeNames, BlockNumber, BlockPtr, CheapClone,
+    DeploymentHash, DeploymentState, Entity, EntityModification, EntityQuery, Error, Logger,
+    QueryExecutionError, StopwatchMetrics, StoreError, StoreEvent, UnfailOutcome, Value, ENV_VARS,
 };
-use graph_graphql::prelude::api_schema;
+use graph::schema::{ApiSchema, InputSchema};
 use web3::types::Address;
 
 use crate::block_range::{block_number, BLOCK_COLUMN, BLOCK_RANGE_COLUMN};
-use crate::catalog;
-use crate::deployment;
+use crate::deployment::{self, OnSync};
 use crate::detail::ErrorDetail;
 use crate::dynds::DataSourcesTable;
+use crate::primary::DeploymentId;
 use crate::relational::index::{CreateIndex, Method};
 use crate::relational::{Layout, LayoutCache, SqlName, Table};
 use crate::relational_queries::FromEntityData;
+use crate::{advisory_lock, catalog, retry};
 use crate::{connection_pool::ConnectionPool, detail};
 use crate::{dynds, primary::Site};
 
@@ -67,7 +73,7 @@ pub enum ReplicaId {
 #[derive(Clone)]
 pub(crate) struct SubgraphInfo {
     /// The schema as supplied by the user
-    pub(crate) input: Arc<Schema>,
+    pub(crate) input: Arc<InputSchema>,
     /// The schema we derive from `input` with `graphql::schema::api::api_schema`
     pub(crate) api: HashMap<ApiVersion, Arc<ApiSchema>>,
     /// The block number at which this subgraph was grafted onto
@@ -79,7 +85,10 @@ pub(crate) struct SubgraphInfo {
     pub(crate) description: Option<String>,
     pub(crate) repository: Option<String>,
     pub(crate) poi_version: ProofOfIndexingVersion,
+    pub(crate) instrument: bool,
 }
+
+type PruneHandle = JoinHandle<Result<(), StoreError>>;
 
 pub struct StoreInner {
     logger: Logger,
@@ -102,6 +111,8 @@ pub struct StoreInner {
     /// hosts this because it lives long enough, but it is managed from
     /// the entities module
     pub(crate) layout_cache: LayoutCache,
+
+    prune_handles: Mutex<HashMap<DeploymentId, PruneHandle>>,
 }
 
 /// Storage of the data for individual deployments. Each `DeploymentStore`
@@ -157,6 +168,7 @@ impl DeploymentStore {
             conn_round_robin_counter: AtomicUsize::new(0),
             subgraph_cache: Mutex::new(LruCache::with_capacity(100)),
             layout_cache: LayoutCache::new(ENV_VARS.store.query_stats_refresh_interval),
+            prune_handles: Mutex::new(HashMap::new()),
         };
 
         DeploymentStore(Arc::new(store))
@@ -164,11 +176,12 @@ impl DeploymentStore {
 
     pub(crate) fn create_deployment(
         &self,
-        schema: &Schema,
+        schema: &InputSchema,
         deployment: DeploymentCreate,
         site: Arc<Site>,
         graft_base: Option<Arc<Layout>>,
         replace: bool,
+        on_sync: OnSync,
     ) -> Result<(), StoreError> {
         let conn = self.get_conn()?;
         conn.transaction(|| -> Result<_, StoreError> {
@@ -211,6 +224,9 @@ impl DeploymentStore {
                     conn.batch_execute(&DataSourcesTable::new(site.namespace.clone()).as_ddl())?;
                 }
             }
+
+            deployment::set_on_sync(&conn, &site, on_sync)?;
+
             Ok(())
         })
     }
@@ -416,9 +432,7 @@ impl DeploymentStore {
         stopwatch: &StopwatchMetrics,
     ) -> Result<usize, StoreError> {
         let _section = stopwatch.start_section("apply_entity_modifications_delete");
-        layout
-            .delete(conn, entity_type, entity_keys, block_number(ptr), stopwatch)
-            .map_err(|_error| anyhow!("Failed to remove entities: {:?}", entity_keys).into())
+        layout.delete(conn, entity_type, entity_keys, block_number(ptr), stopwatch)
     }
 
     /// Execute a closure with a connection to the database.
@@ -550,11 +564,10 @@ impl DeploymentStore {
             return Ok(info.clone());
         }
 
-        let (input_schema, description, repository, spec_version) =
-            deployment::manifest_info(conn, site)?;
+        let manifest_info = deployment::ManifestInfo::load(conn, site)?;
 
         let graft_block =
-            deployment::graft_point(conn, &site.deployment)?.map(|(_, ptr)| ptr.number as i32);
+            deployment::graft_point(conn, &site.deployment)?.map(|(_, ptr)| ptr.number);
 
         let debug_fork = deployment::debug_fork(conn, &site.deployment)?;
 
@@ -564,14 +577,12 @@ impl DeploymentStore {
 
         for version in VERSIONS.iter() {
             let api_version = ApiVersion::from_version(version).expect("Invalid API version");
-            let mut schema = input_schema.clone();
-            schema.document =
-                api_schema(&schema.document).map_err(|e| StoreError::Unknown(e.into()))?;
-            schema.add_subgraph_id_directives(site.deployment.clone());
-            api.insert(api_version, Arc::new(ApiSchema::from_api_schema(schema)?));
+            let schema = manifest_info.input_schema.api_schema()?;
+            api.insert(api_version, Arc::new(schema));
         }
 
-        let spec_version = Version::from_str(&spec_version).map_err(anyhow::Error::from)?;
+        let spec_version =
+            Version::from_str(&manifest_info.spec_version).map_err(anyhow::Error::from)?;
         let poi_version = if spec_version.ge(&SPEC_VERSION_0_0_6) {
             ProofOfIndexingVersion::Fast
         } else {
@@ -579,13 +590,14 @@ impl DeploymentStore {
         };
 
         let info = SubgraphInfo {
-            input: Arc::new(input_schema),
+            input: Arc::new(manifest_info.input_schema),
             api,
             graft_block,
             debug_fork,
-            description,
-            repository,
+            description: manifest_info.description,
+            repository: manifest_info.repository,
             poi_version,
+            instrument: manifest_info.instrument,
         };
 
         // Insert the schema into the cache.
@@ -642,6 +654,19 @@ impl DeploymentStore {
         conn.transaction(|| deployment::set_synced(&conn, id))
     }
 
+    /// Look up the on_sync action for this deployment
+    pub(crate) fn on_sync(&self, site: &Site) -> Result<OnSync, StoreError> {
+        let conn = self.get_conn()?;
+        deployment::on_sync(&conn, site.id)
+    }
+
+    /// Return the source if `site` or `None` if `site` is neither a graft
+    /// nor a copy
+    pub(crate) fn source_of_copy(&self, site: &Site) -> Result<Option<DeploymentId>, StoreError> {
+        let conn = self.get_conn()?;
+        crate::copy::source(&conn, site)
+    }
+
     // Only used for tests
     #[cfg(debug_assertions)]
     pub(crate) fn drop_deployment_schema(
@@ -689,7 +714,7 @@ impl DeploymentStore {
         let conn = self.get_conn()?;
         let layout = self.layout(&conn, site)?;
         let tables = entity
-            .map(|entity| resolve_table_name(&layout, &entity))
+            .map(|entity| resolve_table_name(&layout, entity))
             .transpose()?
             .map(|table| vec![table])
             .unwrap_or_else(|| layout.tables.values().map(Arc::as_ref).collect());
@@ -721,7 +746,7 @@ impl DeploymentStore {
         let layout = self.layout(&conn, site.clone())?;
 
         let tables = entity
-            .map(|entity| resolve_table_name(&layout, &entity))
+            .map(|entity| resolve_table_name(&layout, entity))
             .transpose()?
             .map(|table| vec![table])
             .unwrap_or_else(|| layout.tables.values().map(Arc::as_ref).collect());
@@ -810,10 +835,7 @@ impl DeploymentStore {
             let indexes =
                 catalog::indexes_for_table(conn, schema_name.as_str(), table_name.as_str())
                     .map_err(StoreError::from)?;
-            Ok(indexes
-                .into_iter()
-                .map(|defn| CreateIndex::parse(defn))
-                .collect())
+            Ok(indexes.into_iter().map(CreateIndex::parse).collect())
         })
         .await
     }
@@ -848,57 +870,80 @@ impl DeploymentStore {
         .await
     }
 
+    pub(crate) fn set_history_blocks(
+        &self,
+        site: &Site,
+        history_blocks: BlockNumber,
+        reorg_threshold: BlockNumber,
+    ) -> Result<(), StoreError> {
+        if history_blocks <= reorg_threshold {
+            return Err(constraint_violation!(
+                "the amount of history to keep for sgd{} can not be set to \
+                 {history_blocks} since it must be more than the \
+                 reorg threshold {reorg_threshold}",
+                site.id
+            ));
+        }
+
+        // Invalidate the layout cache for this site so that the next access
+        // will use the updated value
+        self.layout_cache.remove(site);
+
+        let conn = self.get_conn()?;
+        deployment::set_history_blocks(&conn, site, history_blocks)
+    }
+
     pub(crate) async fn prune(
         self: &Arc<Self>,
-        mut reporter: Box<dyn PruneReporter>,
+        reporter: Box<dyn PruneReporter>,
         site: Arc<Site>,
-        earliest_block: BlockNumber,
-        reorg_threshold: BlockNumber,
-        prune_ratio: f64,
+        req: PruneRequest,
     ) -> Result<Box<dyn PruneReporter>, StoreError> {
-        let store = self.clone();
-        self.with_conn(move |conn, cancel| {
+        fn do_prune(
+            store: Arc<DeploymentStore>,
+            conn: &PooledConnection<ConnectionManager<PgConnection>>,
+            site: Arc<Site>,
+            cancel: &CancelHandle,
+            req: PruneRequest,
+            mut reporter: Box<dyn PruneReporter>,
+        ) -> Result<Box<dyn PruneReporter>, CancelableError<StoreError>> {
             let layout = store.layout(conn, site.clone())?;
             cancel.check_cancel()?;
             let state = deployment::state(conn, site.deployment.clone())?;
 
-            if state.latest_block.number <= reorg_threshold {
+            if state.latest_block.number <= req.history_blocks {
+                // We haven't accumulated enough history yet, nothing to prune
                 return Ok(reporter);
             }
 
-            if state.earliest_block_number > earliest_block {
-                return Err(constraint_violation!("earliest block can not move back from {} to {}", state.earliest_block_number, earliest_block).into());
+            if state.earliest_block_number > req.earliest_block {
+                // We already have less history than we need (e.g., because
+                // of a manual onetime prune), nothing to prune
+                return Ok(reporter);
             }
-
-            let final_block = state.latest_block.number - reorg_threshold;
-            if final_block <= earliest_block {
-                return Err(constraint_violation!("the earliest block {} must be at least {} blocks before the current latest block {}", earliest_block, reorg_threshold, state.latest_block.number).into());
-            }
-
-            if let Some((_, graft)) = deployment::graft_point(conn, &site.deployment)? {
-                if graft.block_number() >= earliest_block {
-                    return Err(constraint_violation!("the earliest block {} must be after the graft point {}", earliest_block, graft.block_number()).into());
-                }
-            }
-
-            cancel.check_cancel()?;
 
             conn.transaction(|| {
-                deployment::set_earliest_block(conn, site.as_ref(), earliest_block)
+                deployment::set_earliest_block(conn, site.as_ref(), req.earliest_block)
             })?;
 
             cancel.check_cancel()?;
 
-            layout.prune_by_copying(
-                &store.logger,
-                reporter.as_mut(),
-                conn,
-                earliest_block,
-                final_block,
-                prune_ratio,
-                cancel,
-            )?;
+            layout.prune(&store.logger, reporter.as_mut(), conn, &req, cancel)?;
             Ok(reporter)
+        }
+
+        let store = self.clone();
+        self.with_conn(move |conn, cancel| {
+            // We lock pruning for this deployment to make sure that if the
+            // deployment is reassigned to another node, that node won't
+            // kick off a pruning run while this node might still be pruning
+            if advisory_lock::try_lock_pruning(conn, &site)? {
+                let res = do_prune(store, conn, site.cheap_clone(), cancel, req, reporter);
+                advisory_lock::unlock_pruning(conn, &site)?;
+                res
+            } else {
+                Ok(reporter)
+            }
         })
         .await
     }
@@ -1016,9 +1061,9 @@ impl DeploymentStore {
         let mut by_causality_region = entities
             .into_iter()
             .map(|e| {
-                let causality_region = e.id()?;
-                let digest = match e.get("digest") {
-                    Some(Value::Bytes(b)) => Ok(b.to_owned()),
+                let causality_region = e.id();
+                let digest = match e.get(POI_DIGEST.as_str()) {
+                    Some(Value::Bytes(b)) => Ok(b.clone()),
                     other => Err(anyhow::anyhow!(
                         "Entity has non-bytes digest attribute: {:?}",
                         other
@@ -1050,7 +1095,7 @@ impl DeploymentStore {
     ) -> Result<Option<Entity>, StoreError> {
         let conn = self.get_conn()?;
         let layout = self.layout(&conn, site)?;
-        layout.find(&conn, &key, block)
+        layout.find(&conn, key, block)
     }
 
     /// Retrieve all the entities matching `ids_for_type`, both the type and causality region, from
@@ -1068,6 +1113,18 @@ impl DeploymentStore {
         let layout = self.layout(&conn, site)?;
 
         layout.find_many(&conn, ids_for_type, block)
+    }
+
+    pub(crate) fn get_derived(
+        &self,
+        site: Arc<Site>,
+        derived_query: &DerivedEntityQuery,
+        block: BlockNumber,
+        excluded_keys: &Vec<EntityKey>,
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
+        let conn = self.get_conn()?;
+        let layout = self.layout(&conn, site)?;
+        layout.find_derived(&conn, derived_query, block, excluded_keys)
     }
 
     pub(crate) fn get_changes(
@@ -1095,7 +1152,8 @@ impl DeploymentStore {
     }
 
     pub(crate) fn transact_block_operations(
-        &self,
+        self: &Arc<Self>,
+        logger: &Logger,
         site: Arc<Site>,
         block_ptr_to: &BlockPtr,
         firehose_cursor: &FirehoseCursor,
@@ -1111,14 +1169,14 @@ impl DeploymentStore {
             self.get_conn()?
         };
 
-        let event = deployment::with_lock(&conn, &site, || {
-            conn.transaction(|| -> Result<_, StoreError> {
-                // Emit a store event for the changes we are about to make. We
-                // wait with sending it until we have done all our other work
-                // so that we do not hold a lock on the notification queue
-                // for longer than we have to
-                let event: StoreEvent = StoreEvent::from_mods(&site.deployment, mods);
+        // Emit a store event for the changes we are about to make. We
+        // wait with sending it until we have done all our other work
+        // so that we do not hold a lock on the notification queue
+        // for longer than we have to
+        let event: StoreEvent = StoreEvent::from_mods(&site.deployment, mods);
 
+        let (layout, earliest_block) = deployment::with_lock(&conn, &site, || {
+            conn.transaction(|| -> Result<_, StoreError> {
                 // Make the changes
                 let layout = self.layout(&conn, site.clone())?;
 
@@ -1151,28 +1209,119 @@ impl DeploymentStore {
                     )?;
                 }
 
-                deployment::transact_block(
-                    &conn,
-                    &site,
-                    block_ptr_to,
-                    firehose_cursor,
-                    layout.count_query.as_str(),
-                    count,
-                )?;
+                let earliest_block =
+                    deployment::transact_block(&conn, &site, block_ptr_to, firehose_cursor, count)?;
 
-                Ok(event)
+                Ok((layout, earliest_block))
             })
         })?;
+
+        if block_ptr_to.number as f64
+            > earliest_block as f64
+                + layout.history_blocks as f64 * ENV_VARS.store.history_slack_factor
+        {
+            // This only measures how long it takes to spawn pruning, not
+            // how long pruning itself takes
+            let _section = stopwatch.start_section("transact_blocks_prune");
+
+            self.spawn_prune(
+                logger,
+                site,
+                layout.history_blocks,
+                earliest_block,
+                block_ptr_to.number,
+            )?;
+        }
 
         Ok(event)
     }
 
-    fn rewind_with_conn(
+    fn spawn_prune(
+        self: &Arc<Self>,
+        logger: &Logger,
+        site: Arc<Site>,
+        history_blocks: BlockNumber,
+        earliest_block: BlockNumber,
+        latest_block: BlockNumber,
+    ) -> Result<(), StoreError> {
+        fn prune_in_progress(store: &DeploymentStore, site: &Site) -> Result<bool, StoreError> {
+            let finished = store
+                .prune_handles
+                .lock()
+                .unwrap()
+                .get(&site.id)
+                .map(|handle| handle.is_finished());
+            match finished {
+                Some(true) => {
+                    // A previous prune has finished
+                    let handle = store
+                        .prune_handles
+                        .lock()
+                        .unwrap()
+                        .remove(&site.id)
+                        .unwrap();
+                    match FutureExt::now_or_never(handle) {
+                        Some(Ok(Ok(()))) => Ok(false),
+                        Some(Ok(Err(err))) => Err(StoreError::PruneFailure(err.to_string())),
+                        Some(Err(join_err)) => Err(StoreError::PruneFailure(join_err.to_string())),
+                        None => Err(constraint_violation!(
+                            "prune handle is finished but not ready"
+                        )),
+                    }
+                }
+                Some(false) => {
+                    // A previous prune is still in progress
+                    Ok(true)
+                }
+                None => {
+                    // There is no prune in progress
+                    Ok(false)
+                }
+            }
+        }
+
+        async fn run(
+            logger: Logger,
+            store: Arc<DeploymentStore>,
+            site: Arc<Site>,
+            req: PruneRequest,
+        ) -> Result<(), StoreError> {
+            let logger2 = logger.cheap_clone();
+            retry::forever_async(&logger2, "prune", move || {
+                let store = store.cheap_clone();
+                let reporter = OngoingPruneReporter::new(logger.cheap_clone());
+                let site = site.cheap_clone();
+                async move { store.prune(reporter, site, req).await.map(|_| ()) }
+            })
+            .await
+        }
+
+        if !prune_in_progress(&self, &site)? {
+            let req = PruneRequest::new(
+                &site.as_ref().into(),
+                history_blocks,
+                ENV_VARS.reorg_threshold,
+                earliest_block,
+                latest_block,
+            )?;
+
+            let deployment_id = site.id;
+            let handle = graph::spawn(run(logger.cheap_clone(), self.clone(), site, req));
+            self.prune_handles
+                .lock()
+                .unwrap()
+                .insert(deployment_id, handle);
+        }
+        Ok(())
+    }
+
+    fn rewind_or_truncate_with_conn(
         &self,
         conn: &PgConnection,
         site: Arc<Site>,
         block_ptr_to: BlockPtr,
         firehose_cursor: &FirehoseCursor,
+        truncate: bool,
     ) -> Result<StoreEvent, StoreError> {
         let event = deployment::with_lock(conn, &site, || {
             conn.transaction(|| -> Result<_, StoreError> {
@@ -1205,7 +1354,15 @@ impl DeploymentStore {
                 // Revert the data
                 let layout = self.layout(conn, site.clone())?;
 
-                let (event, count) = layout.revert_block(conn, block)?;
+                let event = if truncate {
+                    let event = layout.truncate_tables(conn)?;
+                    deployment::set_entity_count(conn, site.as_ref(), layout.count_query.as_str())?;
+                    event
+                } else {
+                    let (event, count) = layout.revert_block(conn, block)?;
+                    deployment::update_entity_count(conn, site.as_ref(), count)?;
+                    event
+                };
 
                 // Revert the meta data changes that correspond to this subgraph.
                 // Only certain meta data changes need to be reverted, most
@@ -1214,17 +1371,35 @@ impl DeploymentStore {
                 // changes that might need to be reverted
                 Layout::revert_metadata(conn, &site, block)?;
 
-                deployment::update_entity_count(
-                    conn,
-                    site.as_ref(),
-                    layout.count_query.as_str(),
-                    count,
-                )?;
                 Ok(event)
             })
         })?;
 
         Ok(event)
+    }
+
+    pub(crate) fn truncate(
+        &self,
+        site: Arc<Site>,
+        block_ptr_to: BlockPtr,
+    ) -> Result<StoreEvent, StoreError> {
+        let conn = self.get_conn()?;
+
+        // Unwrap: If we are reverting then the block ptr is not `None`.
+        let block_ptr_from = Self::block_ptr_with_conn(&conn, site.cheap_clone())?.unwrap();
+
+        // Sanity check on block numbers
+        if block_ptr_from.number <= block_ptr_to.number {
+            constraint_violation!(
+                "truncate must go backwards, but would go from block {} to block {}",
+                block_ptr_from.number,
+                block_ptr_to.number
+            );
+        }
+
+        // When rewinding, we reset the firehose cursor. That way, on resume, Firehose will start
+        // from the block_ptr instead (with sanity check to ensure it's resume at the exact block).
+        self.rewind_or_truncate_with_conn(&conn, site, block_ptr_to, &FirehoseCursor::None, true)
     }
 
     pub(crate) fn rewind(
@@ -1248,7 +1423,7 @@ impl DeploymentStore {
 
         // When rewinding, we reset the firehose cursor. That way, on resume, Firehose will start
         // from the block_ptr instead (with sanity check to ensure it's resume at the exact block).
-        self.rewind_with_conn(&conn, site, block_ptr_to, &FirehoseCursor::None)
+        self.rewind_or_truncate_with_conn(&conn, site, block_ptr_to, &FirehoseCursor::None, false)
     }
 
     pub(crate) fn revert_block_operations(
@@ -1266,7 +1441,7 @@ impl DeploymentStore {
             panic!("revert_block_operations must revert only backward, you are trying to revert forward going from subgraph block {} to new block {}", deployment_head, block_ptr_to);
         }
 
-        self.rewind_with_conn(&conn, site, block_ptr_to, firehose_cursor)
+        self.rewind_or_truncate_with_conn(&conn, site, block_ptr_to, firehose_cursor, false)
     }
 
     pub(crate) async fn deployment_state_from_id(
@@ -1442,16 +1617,25 @@ impl DeploymentStore {
                 info!(logger, "Counted the entities";
                       "time_ms" => start.elapsed().as_millis());
 
-                deployment::set_earliest_block(
+                deployment::set_history_blocks(
                     &conn,
                     &dst.site,
-                    src_deployment.earliest_block_number,
+                    src_deployment.manifest.history_blocks,
                 )?;
 
                 // Analyze all tables for this deployment
                 for entity_name in dst.tables.keys() {
                     self.analyze_with_conn(site.cheap_clone(), entity_name.as_str(), &conn)?;
                 }
+
+                // The `earliest_block` for `src` might have changed while
+                // we did the copy if `src` was pruned while we copied;
+                // adjusting it very late in the copy process ensures that
+                // we truly do have all the data starting at
+                // `earliest_block` and do not inadvertently expose data
+                // that might be incomplete because a prune on the source
+                // removed data just before we copied it
+                deployment::copy_earliest_block(&conn, &src.site, &dst.site)?;
 
                 // Set the block ptr to the graft point to signal that we successfully
                 // performed the graft
@@ -1546,7 +1730,7 @@ impl DeploymentStore {
                     warn!(self.logger, "Subgraph error does not have same block hash as deployment head";
                         "subgraph_id" => deployment_id,
                         "error_id" => &subgraph_error.id,
-                        "error_block_hash" => format!("0x{}", hex::encode(&hash_bytes)),
+                        "error_block_hash" => format!("0x{}", hex::encode(hash_bytes)),
                         "deployment_head" => format!("{}", current_ptr.hash),
                     );
 
@@ -1655,6 +1839,35 @@ impl DeploymentStore {
         });
     }
 
+    pub(crate) async fn refresh_materialized_views(&self, logger: &Logger) {
+        async fn run(store: &DeploymentStore) -> Result<(), StoreError> {
+            // We hardcode our materialized views, but could also use
+            // pg_matviews to list all of them, though that might inadvertently
+            // refresh materialized views that operators created themselves
+            const VIEWS: [&str; 3] = [
+                "info.table_sizes",
+                "info.subgraph_sizes",
+                "info.chain_sizes",
+            ];
+            store
+                .with_conn(|conn, cancel| {
+                    for view in VIEWS {
+                        let query = format!("refresh materialized view {}", view);
+                        diesel::sql_query(&query).execute(conn)?;
+                        cancel.check_cancel()?;
+                    }
+                    Ok(())
+                })
+                .await
+        }
+
+        run(self).await.unwrap_or_else(|e| {
+            warn!(logger, "Refreshing materialized views failed. We will try again in a few hours";
+                  "error" => e.to_string(),
+                  "shard" => self.pool.shard.as_str())
+        });
+    }
+
     pub(crate) async fn health(
         &self,
         site: &Site,
@@ -1722,4 +1935,81 @@ fn resolve_column_names<'a, T: AsRef<str>>(
             }
         })
         .collect()
+}
+
+/// A helper to log progress during pruning that is kicked off from
+/// `transact_block_operations`
+struct OngoingPruneReporter {
+    logger: Logger,
+    start: Instant,
+    analyze_start: Instant,
+    analyze_duration: Duration,
+    rows_copied: usize,
+    rows_deleted: usize,
+    tables: Vec<String>,
+}
+
+impl OngoingPruneReporter {
+    fn new(logger: Logger) -> Box<Self> {
+        Box::new(Self {
+            logger,
+            start: Instant::now(),
+            analyze_start: Instant::now(),
+            analyze_duration: Duration::from_secs(0),
+            rows_copied: 0,
+            rows_deleted: 0,
+            tables: Vec::new(),
+        })
+    }
+}
+
+impl OngoingPruneReporter {
+    fn tables_as_string(&self) -> String {
+        if self.tables.is_empty() {
+            "ø".to_string()
+        } else {
+            format!("[{}]", self.tables.iter().join(","))
+        }
+    }
+}
+
+impl PruneReporter for OngoingPruneReporter {
+    fn start(&mut self, req: &PruneRequest) {
+        self.start = Instant::now();
+        info!(&self.logger, "Start pruning historical entities";
+              "history_blocks" => req.history_blocks,
+              "earliest_block" => req.earliest_block,
+              "latest_block" => req.latest_block);
+    }
+
+    fn start_analyze(&mut self) {
+        self.analyze_start = Instant::now()
+    }
+
+    fn finish_analyze(&mut self, _stats: &[VersionStats], analyzed: &[&str]) {
+        self.analyze_duration += self.analyze_start.elapsed();
+        debug!(&self.logger, "Analyzed {} tables", analyzed.len(); "time_s" => self.analyze_start.elapsed().as_secs());
+    }
+
+    fn start_table(&mut self, table: &str) {
+        self.tables.push(table.to_string());
+    }
+
+    fn prune_batch(&mut self, _table: &str, rows: usize, phase: PrunePhase, _finished: bool) {
+        match phase.strategy() {
+            PruningStrategy::Rebuild => self.rows_copied += rows,
+            PruningStrategy::Delete => self.rows_deleted += rows,
+        }
+    }
+    fn finish(&mut self) {
+        info!(
+            &self.logger,
+            "Finished pruning entities";
+            "tables" => self.tables_as_string(),
+            "rows_deleted" => self.rows_deleted,
+            "rows_copied" => self.rows_copied,
+            "time_s" => self.start.elapsed().as_secs(),
+            "analyze_time_s" => self.analyze_duration.as_secs()
+        )
+    }
 }

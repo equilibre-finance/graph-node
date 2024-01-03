@@ -108,7 +108,7 @@ pub fn show(
 ) -> Result<(), anyhow::Error> {
     let (site, conn) = site_and_conn(pools, search)?;
 
-    let stats = store_catalog::stats(&conn, &site.namespace)?;
+    let stats = store_catalog::stats(&conn, &site)?;
 
     let account_like = store_catalog::account_like(&conn, &site)?;
 
@@ -134,7 +134,7 @@ fn analyze_loc(
         Some(entity_name) => println!("Analyzing table sgd{}.{entity_name}", locator.id),
         None => println!("Analyzing all tables for sgd{}", locator.id),
     }
-    store.analyze(&locator, entity_name).map_err(|e| anyhow!(e))
+    store.analyze(locator, entity_name).map_err(|e| anyhow!(e))
 }
 
 pub fn target(

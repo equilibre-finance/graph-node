@@ -283,6 +283,17 @@ impl CopyState {
     }
 }
 
+pub(crate) fn source(conn: &PgConnection, dst: &Site) -> Result<Option<DeploymentId>, StoreError> {
+    use copy_state as cs;
+
+    cs::table
+        .filter(cs::dst.eq(dst.id))
+        .select(cs::src)
+        .get_result::<DeploymentId>(conn)
+        .optional()
+        .map_err(StoreError::from)
+}
+
 /// Track the desired size of a batch in such a way that doing the next
 /// batch gets close to TARGET_DURATION for the time it takes to copy one
 /// batch, but don't step up the size by more than 2x at once
@@ -408,7 +419,7 @@ impl TableState {
         } else {
             "lower(block_range) <= $1"
         };
-        let target_vid = sql_query(&format!(
+        let target_vid = sql_query(format!(
             "select coalesce(max(vid), -1) as max_vid from {} where {}",
             src.qualified_name.as_str(),
             max_block_clause

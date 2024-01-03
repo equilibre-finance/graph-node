@@ -1,7 +1,13 @@
-use graph::blockchain::BlockchainKind;
+use graph::anyhow;
+use graph::blockchain::client::ChainClient;
+use graph::blockchain::firehose_block_ingestor::FirehoseBlockIngestor;
+use graph::blockchain::{
+    BasicBlockchainBuilder, BlockIngestor, BlockchainBuilder, BlockchainKind, NoopRuntimeAdapter,
+};
 use graph::cheap_clone::CheapClone;
+use graph::components::store::DeploymentCursorTracker;
 use graph::data::subgraph::UnifiedMappingApiVersion;
-use graph::firehose::{FirehoseEndpoint, FirehoseEndpoints};
+use graph::firehose::FirehoseEndpoint;
 use graph::prelude::{MetricsRegistry, TryFutureExt};
 use graph::{
     anyhow::Result,
@@ -23,7 +29,6 @@ use std::sync::Arc;
 
 use crate::adapter::TriggerFilter;
 use crate::data_source::{DataSourceTemplate, UnresolvedDataSourceTemplate};
-use crate::runtime::RuntimeAdapter;
 use crate::trigger::{self, NearTrigger};
 use crate::{
     codec,
@@ -53,8 +58,6 @@ impl BlockStreamBuilder<Chain> for NearStreamBuilder {
             )
             .unwrap_or_else(|_| panic!("no adapter for network {}", chain.name));
 
-        let firehose_endpoint = chain.firehose_endpoints.random()?;
-
         let logger = chain
             .logger_factory
             .subgraph_logger(&deployment)
@@ -64,7 +67,7 @@ impl BlockStreamBuilder<Chain> for NearStreamBuilder {
 
         Ok(Box::new(FirehoseBlockStream::new(
             deployment.hash,
-            firehose_endpoint,
+            chain.chain_client(),
             subgraph_current_block,
             block_cursor,
             firehose_mapper,
@@ -78,7 +81,7 @@ impl BlockStreamBuilder<Chain> for NearStreamBuilder {
 
     async fn build_polling(
         &self,
-        _chain: Arc<Chain>,
+        _chain: &Chain,
         _deployment: DeploymentLocator,
         _start_blocks: Vec<BlockNumber>,
         _subgraph_current_block: Option<BlockPtr>,
@@ -92,9 +95,9 @@ impl BlockStreamBuilder<Chain> for NearStreamBuilder {
 pub struct Chain {
     logger_factory: LoggerFactory,
     name: String,
-    firehose_endpoints: Arc<FirehoseEndpoints>,
+    client: Arc<ChainClient<Self>>,
     chain_store: Arc<dyn ChainStore>,
-    metrics_registry: Arc<dyn MetricsRegistry>,
+    metrics_registry: Arc<MetricsRegistry>,
     block_stream_builder: Arc<dyn BlockStreamBuilder<Self>>,
 }
 
@@ -104,22 +107,15 @@ impl std::fmt::Debug for Chain {
     }
 }
 
-impl Chain {
-    pub fn new(
-        logger_factory: LoggerFactory,
-        name: String,
-        chain_store: Arc<dyn ChainStore>,
-        firehose_endpoints: FirehoseEndpoints,
-        metrics_registry: Arc<dyn MetricsRegistry>,
-        block_stream_builder: Arc<dyn BlockStreamBuilder<Self>>,
-    ) -> Self {
+impl BlockchainBuilder<Chain> for BasicBlockchainBuilder {
+    fn build(self) -> Chain {
         Chain {
-            logger_factory,
-            name,
-            firehose_endpoints: Arc::new(firehose_endpoints),
-            chain_store,
-            metrics_registry,
-            block_stream_builder,
+            logger_factory: self.logger_factory,
+            name: self.name,
+            chain_store: self.chain_store,
+            client: Arc::new(ChainClient::new_firehose(self.firehose_endpoints)),
+            metrics_registry: self.metrics_registry,
+            block_stream_builder: Arc::new(NearStreamBuilder {}),
         }
     }
 }
@@ -128,6 +124,7 @@ impl Chain {
 impl Blockchain for Chain {
     const KIND: BlockchainKind = BlockchainKind::Near;
 
+    type Client = ();
     type Block = codec::Block;
 
     type DataSource = DataSource;
@@ -156,12 +153,11 @@ impl Blockchain for Chain {
         Ok(Arc::new(adapter))
     }
 
-    async fn new_firehose_block_stream(
+    async fn new_block_stream(
         &self,
         deployment: DeploymentLocator,
-        block_cursor: FirehoseCursor,
+        store: impl DeploymentCursorTracker,
         start_blocks: Vec<BlockNumber>,
-        subgraph_current_block: Option<BlockPtr>,
         filter: Arc<Self::TriggerFilter>,
         unified_api_version: UnifiedMappingApiVersion,
     ) -> Result<Box<dyn BlockStream<Self>>, Error> {
@@ -169,9 +165,9 @@ impl Blockchain for Chain {
             .build_firehose(
                 self,
                 deployment,
-                block_cursor,
+                store.firehose_cursor(),
                 start_blocks,
-                subgraph_current_block,
+                store.block_ptr(),
                 filter,
                 unified_api_version,
             )
@@ -190,17 +186,6 @@ impl Blockchain for Chain {
         unimplemented!("This chain does not support Dynamic Data Sources. is_refetch_block_required always returns false, this shouldn't be called.")
     }
 
-    async fn new_polling_block_stream(
-        &self,
-        _deployment: DeploymentLocator,
-        _start_blocks: Vec<BlockNumber>,
-        _subgraph_current_block: Option<BlockPtr>,
-        _filter: Arc<Self::TriggerFilter>,
-        _unified_api_version: UnifiedMappingApiVersion,
-    ) -> Result<Box<dyn BlockStream<Self>>, Error> {
-        panic!("NEAR does not support polling block stream")
-    }
-
     fn chain_store(&self) -> Arc<dyn ChainStore> {
         self.chain_store.clone()
     }
@@ -210,7 +195,7 @@ impl Blockchain for Chain {
         logger: &Logger,
         number: BlockNumber,
     ) -> Result<BlockPtr, IngestorError> {
-        let firehose_endpoint = self.firehose_endpoints.random()?;
+        let firehose_endpoint = self.client.firehose_endpoint()?;
 
         firehose_endpoint
             .block_ptr_for_number::<codec::HeaderOnlyBlock>(logger, number)
@@ -219,11 +204,22 @@ impl Blockchain for Chain {
     }
 
     fn runtime_adapter(&self) -> Arc<dyn RuntimeAdapterTrait<Self>> {
-        Arc::new(RuntimeAdapter {})
+        Arc::new(NoopRuntimeAdapter::default())
     }
 
-    fn is_firehose_supported(&self) -> bool {
-        true
+    fn chain_client(&self) -> Arc<ChainClient<Self>> {
+        self.client.clone()
+    }
+
+    fn block_ingestor(&self) -> anyhow::Result<Box<dyn BlockIngestor>> {
+        let ingestor = FirehoseBlockIngestor::<crate::HeaderOnlyBlock, Self>::new(
+            self.chain_store.cheap_clone(),
+            self.chain_client(),
+            self.logger_factory
+                .component_logger("NearFirehoseBlockIngestor", None),
+            self.name.clone(),
+        );
+        Ok(Box::new(ingestor))
     }
 }
 

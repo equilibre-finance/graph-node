@@ -249,7 +249,7 @@ impl Template for BigInt {
             }
             None => 1,
         };
-        BigInt::from(3u64).pow(size as u8) * BigInt::from(f)
+        BigInt::from(3u64).pow(size as u8).unwrap() * BigInt::from(f)
     }
 
     fn sample(&self, size: usize, rng: Option<&mut SmallRng>) -> Box<Self> {
@@ -274,7 +274,7 @@ impl Template for BigDecimal {
             Some(rng) => rng.gen_range(-100..=100),
             None => 1,
         };
-        let bi = BigInt::from(3u64).pow(size as u8) * BigInt::from(f);
+        let bi = BigInt::from(3u64).pow(size as u8).unwrap() * BigInt::from(f);
         BigDecimal::new(bi, exp)
     }
 
@@ -295,9 +295,7 @@ impl Template for HashMap<String, String> {
 
     fn sample(&self, size: usize, _rng: Option<&mut SmallRng>) -> Box<Self> {
         Box::new(HashMap::from_iter(
-            self.iter()
-                .take(size)
-                .map(|(k, v)| (k.to_owned(), v.to_owned())),
+            self.iter().take(size).map(|(k, v)| (k.clone(), v.clone())),
         ))
     }
 }
@@ -326,7 +324,10 @@ fn make_object(size: usize, mut rng: Option<&mut SmallRng>) -> Object {
             7 => {
                 let mut obj = Vec::new();
                 for j in 0..(i % 51) {
-                    obj.push((format!("key{}", j), r::Value::String(format!("value{}", j))));
+                    obj.push((
+                        Word::from(format!("key{}", j)),
+                        r::Value::String(format!("value{}", j)),
+                    ));
                 }
                 r::Value::Object(Object::from_iter(obj))
             }
@@ -334,7 +335,7 @@ fn make_object(size: usize, mut rng: Option<&mut SmallRng>) -> Object {
         };
 
         let key = rng.as_deref_mut().map(|rng| rng.gen()).unwrap_or(i) % modulus;
-        obj.push((format!("val{}", key), value));
+        obj.push((Word::from(format!("val{}", key)), value));
     }
     Object::from_iter(obj)
 }
@@ -348,7 +349,7 @@ fn make_domains(size: usize, _rng: Option<&mut SmallRng>) -> Object {
     };
 
     let domains: Vec<_> = (0..size).map(|_| owner.clone()).collect();
-    Object::from_iter([("domains".to_string(), r::Value::List(domains))])
+    Object::from_iter([("domains".into(), r::Value::List(domains))])
 }
 
 /// Template for testing caching of `Object`
@@ -364,7 +365,7 @@ impl Template for Object {
             Box::new(Object::from_iter(
                 self.iter()
                     .take(size)
-                    .map(|(k, v)| (k.to_owned(), v.to_owned())),
+                    .map(|(k, v)| (Word::from(k), v.clone())),
             ))
         } else {
             Box::new(make_object(size, rng))
@@ -387,7 +388,7 @@ impl Template for QueryResult {
                     .unwrap()
                     .iter()
                     .take(size)
-                    .map(|(k, v)| (k.to_owned(), v.to_owned())),
+                    .map(|(k, v)| (Word::from(k), v.clone())),
             )))
         } else {
             Box::new(QueryResult::new(make_domains(size, rng)))
@@ -451,7 +452,7 @@ impl Template for ValueMap {
                 self.0
                     .iter()
                     .take(size)
-                    .map(|(k, v)| (k.to_owned(), v.to_owned())),
+                    .map(|(k, v)| (k.clone(), v.clone())),
             )))
         } else {
             Box::new(Self::make_map(size, rng))

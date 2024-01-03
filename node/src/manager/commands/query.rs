@@ -5,6 +5,7 @@ use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
 use graph::data::query::Trace;
+use graph::log::escape_control_chars;
 use graph::prelude::r;
 use graph::{
     data::query::QueryTarget,
@@ -42,10 +43,7 @@ pub async fn run(
         .map(|v| {
             let mut pair = v.splitn(2, '=').map(|s| s.to_string());
             let key = pair.next();
-            let value = pair
-                .next()
-                .map(|s| r::Value::String(s))
-                .unwrap_or(r::Value::Null);
+            let value = pair.next().map(r::Value::String).unwrap_or(r::Value::Null);
             match key {
                 Some(key) => Ok((key, value)),
                 None => Err(anyhow!(
@@ -68,7 +66,10 @@ pub async fn run(
 
     if let Some(output) = output {
         let mut f = File::create(output)?;
-        let json = serde_json::to_string(&res)?;
+
+        // Escape control characters in the query output, as a precaution against injecting control
+        // characters in a terminal.
+        let json = escape_control_chars(serde_json::to_string(&res)?);
         writeln!(f, "{}", json)?;
     }
 

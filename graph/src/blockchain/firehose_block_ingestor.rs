@@ -3,16 +3,19 @@ use std::{marker::PhantomData, sync::Arc, time::Duration};
 use crate::{
     blockchain::Block as BlockchainBlock,
     components::store::ChainStore,
-    firehose::{self, decode_firehose_block, FirehoseEndpoint, HeaderOnly},
+    firehose::{self, decode_firehose_block, HeaderOnly},
     prelude::{error, info, Logger},
     util::backoff::ExponentialBackoff,
 };
 use anyhow::{Context, Error};
+use async_trait::async_trait;
 use futures03::StreamExt;
 use prost::Message;
 use prost_types::Any;
-use slog::trace;
+use slog::{o, trace};
 use tonic::Streaming;
+
+use super::{client::ChainClient, BlockIngestor, Blockchain};
 
 const TRANSFORM_ETHEREUM_HEADER_ONLY: &str =
     "type.googleapis.com/sf.ethereum.transform.v1.HeaderOnly";
@@ -21,9 +24,9 @@ pub enum Transforms {
     EthereumHeaderOnly,
 }
 
-impl Into<Any> for &Transforms {
-    fn into(self) -> Any {
-        match self {
+impl From<&Transforms> for Any {
+    fn from(val: &Transforms) -> Self {
+        match val {
             Transforms::EthereumHeaderOnly => Any {
                 type_url: TRANSFORM_ETHEREUM_HEADER_ONLY.to_owned(),
                 value: HeaderOnly {}.encode_to_vec(),
@@ -32,33 +35,36 @@ impl Into<Any> for &Transforms {
     }
 }
 
-pub struct FirehoseBlockIngestor<M>
+pub struct FirehoseBlockIngestor<M, C: Blockchain>
 where
     M: prost::Message + BlockchainBlock + Default + 'static,
 {
     chain_store: Arc<dyn ChainStore>,
-    endpoint: Arc<FirehoseEndpoint>,
+    client: Arc<ChainClient<C>>,
     logger: Logger,
     default_transforms: Vec<Transforms>,
+    chain_name: String,
 
     phantom: PhantomData<M>,
 }
 
-impl<M> FirehoseBlockIngestor<M>
+impl<M, C: Blockchain> FirehoseBlockIngestor<M, C>
 where
     M: prost::Message + BlockchainBlock + Default + 'static,
 {
     pub fn new(
         chain_store: Arc<dyn ChainStore>,
-        endpoint: Arc<FirehoseEndpoint>,
+        client: Arc<ChainClient<C>>,
         logger: Logger,
-    ) -> FirehoseBlockIngestor<M> {
+        chain_name: String,
+    ) -> FirehoseBlockIngestor<M, C> {
         FirehoseBlockIngestor {
             chain_store,
-            endpoint,
+            client,
             logger,
             phantom: PhantomData {},
             default_transforms: vec![],
+            chain_name,
         }
     }
 
@@ -67,53 +73,12 @@ where
         self
     }
 
-    pub async fn run(self) {
-        let mut latest_cursor = self.fetch_head_cursor().await;
-        let mut backoff =
-            ExponentialBackoff::new(Duration::from_millis(250), Duration::from_secs(30));
-
-        loop {
-            info!(
-                self.logger,
-                "Blockstream disconnected, connecting"; "endpoint uri" => format_args!("{}", self.endpoint), "cursor" => format_args!("{}", latest_cursor),
-            );
-
-            let result = self
-                .endpoint
-                .clone()
-                .stream_blocks(firehose::Request {
-                    // Starts at current HEAD block of the chain (viewed from Firehose side)
-                    start_block_num: -1,
-                    cursor: latest_cursor.clone(),
-                    final_blocks_only: false,
-                    transforms: self.default_transforms.iter().map(|t| t.into()).collect(),
-                    ..Default::default()
-                })
-                .await;
-
-            match result {
-                Ok(stream) => {
-                    info!(self.logger, "Blockstream connected, consuming blocks");
-
-                    // Consume the stream of blocks until an error is hit
-                    latest_cursor = self.process_blocks(latest_cursor, stream).await
-                }
-                Err(e) => {
-                    error!(self.logger, "Unable to connect to endpoint: {:#}", e);
-                }
-            }
-
-            // If we reach this point, we must wait a bit before retrying
-            backoff.sleep_async().await;
-        }
-    }
-
     async fn fetch_head_cursor(&self) -> String {
         let mut backoff =
             ExponentialBackoff::new(Duration::from_millis(250), Duration::from_secs(30));
         loop {
             match self.chain_store.clone().chain_head_cursor() {
-                Ok(cursor) => return cursor.unwrap_or_else(|| "".to_string()),
+                Ok(cursor) => return cursor.unwrap_or_default(),
                 Err(e) => {
                     error!(self.logger, "Fetching chain head cursor failed: {:#}", e);
 
@@ -190,5 +155,71 @@ where
             .context("Updating chain head")?;
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl<M, C: Blockchain> BlockIngestor for FirehoseBlockIngestor<M, C>
+where
+    M: prost::Message + BlockchainBlock + Default + 'static,
+{
+    async fn run(self: Box<Self>) {
+        let mut latest_cursor = self.fetch_head_cursor().await;
+        let mut backoff =
+            ExponentialBackoff::new(Duration::from_millis(250), Duration::from_secs(30));
+
+        loop {
+            let endpoint = match self.client.firehose_endpoint() {
+                Ok(endpoint) => endpoint,
+                Err(err) => {
+                    error!(
+                        self.logger,
+                        "Unable to get a connection for block ingestor, err: {}", err
+                    );
+                    backoff.sleep_async().await;
+                    continue;
+                }
+            };
+
+            let logger = self.logger.new(
+                o!("provider" => endpoint.provider.to_string(), "network_name"=> self.network_name()),
+            );
+
+            info!(
+                logger,
+                "Trying to reconnect the Blockstream after disconnect"; "endpoint uri" => format_args!("{}", endpoint), "cursor" => format_args!("{}", latest_cursor),
+            );
+
+            let result = endpoint
+                .clone()
+                .stream_blocks(firehose::Request {
+                    // Starts at current HEAD block of the chain (viewed from Firehose side)
+                    start_block_num: -1,
+                    cursor: latest_cursor.clone(),
+                    final_blocks_only: false,
+                    transforms: self.default_transforms.iter().map(|t| t.into()).collect(),
+                    ..Default::default()
+                })
+                .await;
+
+            match result {
+                Ok(stream) => {
+                    info!(logger, "Blockstream connected, consuming blocks");
+
+                    // Consume the stream of blocks until an error is hit
+                    latest_cursor = self.process_blocks(latest_cursor, stream).await
+                }
+                Err(e) => {
+                    error!(logger, "Unable to connect to endpoint: {:#}", e);
+                }
+            }
+
+            // If we reach this point, we must wait a bit before retrying
+            backoff.sleep_async().await;
+        }
+    }
+
+    fn network_name(&self) -> String {
+        self.chain_name.clone()
     }
 }

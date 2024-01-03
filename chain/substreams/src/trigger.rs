@@ -7,10 +7,10 @@ use graph::{
         store::{DeploymentLocator, EntityKey, EntityType, SubgraphFork},
         subgraph::{MappingError, ProofOfIndexingEvent, SharedProofOfIndexing},
     },
-    data::store::scalar::Bytes,
+    data::{store::scalar::Bytes, value::Word},
     data_source::{self, CausalityRegion},
     prelude::{
-        anyhow, async_trait, BigDecimal, BigInt, BlockHash, BlockNumber, BlockState, Entity,
+        anyhow, async_trait, BigDecimal, BigInt, BlockHash, BlockNumber, BlockState,
         RuntimeHostBuilder, Value,
     },
     slog::Logger,
@@ -38,7 +38,7 @@ impl ToAscPtr for TriggerData {
         self,
         _heap: &mut H,
         _gas: &graph::runtime::gas::GasCounter,
-    ) -> Result<graph::runtime::AscPtr<()>, graph::runtime::DeterministicHostError> {
+    ) -> Result<graph::runtime::AscPtr<()>, graph::runtime::HostExportError> {
         unimplemented!()
     }
 }
@@ -172,6 +172,7 @@ where
         causality_region: &str,
         _debug_fork: &Option<Arc<dyn SubgraphFork>>,
         _subgraph_metrics: &Arc<graph::prelude::SubgraphInstanceMetrics>,
+        _instrument: bool,
     ) -> Result<BlockState<Chain>, MappingError> {
         for entity_change in block.changes.entity_changes.iter() {
             match entity_change.operation() {
@@ -188,7 +189,7 @@ where
                         entity_id: entity_id.clone().into(),
                         causality_region: CausalityRegion::ONCHAIN, // Substreams don't currently support offchain data
                     };
-                    let mut data: HashMap<String, Value> = HashMap::from_iter(vec![]);
+                    let mut data: HashMap<Word, Value> = HashMap::from_iter(vec![]);
 
                     for field in entity_change.fields.iter() {
                         let new_value: &codec::value::Typed = match &field.new_value {
@@ -199,7 +200,9 @@ where
                         };
 
                         let value: Value = decode_value(new_value)?;
-                        *data.entry(field.name.clone()).or_insert(Value::Null) = value;
+                        *data
+                            .entry(Word::from(field.name.clone()))
+                            .or_insert(Value::Null) = value;
                     }
 
                     write_poi_event(
@@ -207,13 +210,18 @@ where
                         &ProofOfIndexingEvent::SetEntity {
                             entity_type,
                             id: &entity_id,
+                            // TODO: This should be an entity so we do not have to build the intermediate HashMap
                             data: &data,
                         },
                         causality_region,
                         logger,
                     );
 
-                    state.entity_cache.set(key, Entity::from(data))?;
+                    let id = state.entity_cache.schema.id_value(&key)?;
+                    data.insert(Word::from("id"), id);
+
+                    let entity = state.entity_cache.make_entity(data)?;
+                    state.entity_cache.set(key, entity)?;
                 }
                 Operation::Delete => {
                     let entity_type: &str = &entity_change.entity;
@@ -267,8 +275,8 @@ fn decode_value(value: &crate::codec::value::Typed) -> Result<Value, MappingErro
             Ok(Value::String(string))
         }
 
-        Typed::Bytes(new_value) => base64::decode(&new_value)
-            .map(|bs| Value::Bytes(Bytes::from(bs.as_ref())))
+        Typed::Bytes(new_value) => base64::decode(new_value)
+            .map(|bs| Value::Bytes(Bytes::from(bs)))
             .map_err(|err| MappingError::Unknown(anyhow::Error::from(err))),
 
         Typed::Bool(new_value) => Ok(Value::Bool(*new_value)),

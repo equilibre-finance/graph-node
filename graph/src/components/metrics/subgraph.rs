@@ -1,11 +1,12 @@
 use prometheus::Counter;
 
 use crate::blockchain::block_stream::BlockStreamMetrics;
-use crate::prelude::{Gauge, Histogram, HostMetrics, MetricsRegistry};
+use crate::prelude::{Gauge, Histogram, HostMetrics};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::stopwatch::StopwatchMetrics;
+use super::MetricsRegistry;
 
 pub struct SubgraphInstanceMetrics {
     pub block_trigger_count: Box<Histogram>,
@@ -19,7 +20,7 @@ pub struct SubgraphInstanceMetrics {
 
 impl SubgraphInstanceMetrics {
     pub fn new(
-        registry: Arc<dyn MetricsRegistry>,
+        registry: Arc<MetricsRegistry>,
         subgraph_hash: &str,
         stopwatch: StopwatchMetrics,
     ) -> Self {
@@ -78,7 +79,7 @@ impl SubgraphInstanceMetrics {
         self.trigger_processing_duration.observe(duration);
     }
 
-    pub fn unregister(&self, registry: Arc<dyn MetricsRegistry>) {
+    pub fn unregister(&self, registry: Arc<MetricsRegistry>) {
         registry.unregister(self.block_processing_duration.clone());
         registry.unregister(self.block_trigger_count.clone());
         registry.unregister(self.trigger_processing_duration.clone());
@@ -86,20 +87,32 @@ impl SubgraphInstanceMetrics {
     }
 }
 
-pub struct SubgraphInstanceManagerMetrics {
-    pub subgraph_count: Box<Gauge>,
+#[derive(Debug)]
+pub struct SubgraphCountMetric {
+    pub running_count: Box<Gauge>,
+    pub deployment_count: Box<Gauge>,
 }
 
-impl SubgraphInstanceManagerMetrics {
-    pub fn new(registry: Arc<dyn MetricsRegistry>) -> Self {
-        let subgraph_count = registry
+impl SubgraphCountMetric {
+    pub fn new(registry: Arc<MetricsRegistry>) -> Self {
+        let running_count = registry
             .new_gauge(
-                "deployment_count",
+                "deployment_running_count",
                 "Counts the number of deployments currently being indexed by the graph-node.",
                 HashMap::new(),
             )
             .expect("failed to create `deployment_count` gauge");
-        Self { subgraph_count }
+        let deployment_count = registry
+            .new_gauge(
+                "deployment_count",
+                "Counts the number of deployments currently deployed to the graph-node.",
+                HashMap::new(),
+            )
+            .expect("failed to create `deployment_count` gauge");
+        Self {
+            running_count,
+            deployment_count,
+        }
     }
 }
 

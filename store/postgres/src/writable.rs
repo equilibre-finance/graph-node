@@ -1,19 +1,20 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
 use std::{collections::BTreeMap, sync::Arc};
 
 use graph::blockchain::block_stream::FirehoseCursor;
-use graph::components::store::EntityKey;
-use graph::components::store::ReadStore;
+use graph::components::store::{DeploymentCursorTracker, DerivedEntityQuery, EntityKey, ReadStore};
+use graph::constraint_violation;
 use graph::data::subgraph::schema;
 use graph::data_source::CausalityRegion;
 use graph::prelude::{
-    BlockNumber, Entity, MetricsRegistry, Schema, SubgraphDeploymentEntity, SubgraphStore as _,
+    BlockNumber, Entity, MetricsRegistry, SubgraphDeploymentEntity, SubgraphStore as _,
     BLOCK_NUMBER_MAX,
 };
-use graph::slog::info;
+use graph::schema::InputSchema;
+use graph::slog::{info, warn};
+use graph::tokio::task::JoinHandle;
 use graph::util::bounded_queue::BoundedQueue;
 use graph::{
     cheap_clone::CheapClone,
@@ -23,12 +24,13 @@ use graph::{
         BlockPtr, DeploymentHash, EntityModification, Error, Logger, StopwatchMetrics, StoreError,
         StoreEvent, UnfailOutcome, ENV_VARS,
     },
-    slog::{error, warn},
-    util::backoff::ExponentialBackoff,
+    slog::error,
 };
 use store::StoredDynamicDataSource;
 
 use crate::deployment_store::DeploymentStore;
+use crate::primary::DeploymentId;
+use crate::retry;
 use crate::{primary, primary::Site, relational::Layout, SubgraphStore};
 
 /// A wrapper around `SubgraphStore` that only exposes functions that are
@@ -54,6 +56,10 @@ impl WritableSubgraphStore {
     fn load_deployment(&self, site: &Site) -> Result<SubgraphDeploymentEntity, StoreError> {
         self.0.load_deployment(site)
     }
+
+    fn find_site(&self, id: DeploymentId) -> Result<Arc<Site>, StoreError> {
+        self.0.find_site(id)
+    }
 }
 
 /// Write synchronously to the actual store, i.e., once a method returns,
@@ -64,13 +70,10 @@ struct SyncStore {
     store: WritableSubgraphStore,
     writable: Arc<DeploymentStore>,
     site: Arc<Site>,
-    input_schema: Arc<Schema>,
+    input_schema: Arc<InputSchema>,
 }
 
 impl SyncStore {
-    const BACKOFF_BASE: Duration = Duration::from_millis(100);
-    const BACKOFF_CEIL: Duration = Duration::from_secs(10);
-
     fn new(
         subgraph_store: SubgraphStore,
         logger: Logger,
@@ -86,49 +89,6 @@ impl SyncStore {
             site,
             input_schema,
         })
-    }
-
-    fn log_backoff_warning(&self, op: &str, backoff: &ExponentialBackoff) {
-        warn!(self.logger,
-            "database unavailable, will retry";
-            "operation" => op,
-            "attempt" => backoff.attempt,
-            "delay_ms" => backoff.delay().as_millis());
-    }
-
-    fn retry<T, F>(&self, op: &str, f: F) -> Result<T, StoreError>
-    where
-        F: Fn() -> Result<T, StoreError>,
-    {
-        let mut backoff = ExponentialBackoff::new(Self::BACKOFF_BASE, Self::BACKOFF_CEIL);
-        loop {
-            match f() {
-                Ok(v) => return Ok(v),
-                Err(StoreError::DatabaseUnavailable) => {
-                    self.log_backoff_warning(op, &backoff);
-                }
-                Err(e) => return Err(e),
-            }
-            backoff.sleep();
-        }
-    }
-
-    async fn retry_async<T, F, Fut>(&self, op: &str, f: F) -> Result<T, StoreError>
-    where
-        F: Fn() -> Fut,
-        Fut: std::future::Future<Output = Result<T, StoreError>>,
-    {
-        let mut backoff = ExponentialBackoff::new(Self::BACKOFF_BASE, Self::BACKOFF_CEIL);
-        loop {
-            match f().await {
-                Ok(v) => return Ok(v),
-                Err(StoreError::DatabaseUnavailable) => {
-                    self.log_backoff_warning(op, &backoff);
-                }
-                Err(e) => return Err(e),
-            }
-            backoff.sleep_async().await;
-        }
     }
 
     /// Try to send a `StoreEvent`; if sending fails, log the error but
@@ -148,7 +108,7 @@ impl SyncStore {
 // Methods that mirror `WritableStoreTrait`
 impl SyncStore {
     async fn block_ptr(&self) -> Result<Option<BlockPtr>, StoreError> {
-        self.retry_async("block_ptr", || {
+        retry::forever_async(&self.logger, "block_ptr", || {
             let site = self.site.clone();
             async move { self.writable.block_ptr(site).await }
         })
@@ -163,7 +123,7 @@ impl SyncStore {
     }
 
     fn start_subgraph_deployment(&self, logger: &Logger) -> Result<(), StoreError> {
-        self.retry("start_subgraph_deployment", || {
+        retry::forever(&self.logger, "start_subgraph_deployment", || {
             let graft_base = match self.writable.graft_pending(&self.site.deployment)? {
                 Some((base_id, base_ptr)) => {
                     let src = self.store.layout(&base_id)?;
@@ -183,7 +143,7 @@ impl SyncStore {
         block_ptr_to: BlockPtr,
         firehose_cursor: &FirehoseCursor,
     ) -> Result<(), StoreError> {
-        self.retry("revert_block_operations", || {
+        retry::forever(&self.logger, "revert_block_operations", || {
             let event = self.writable.revert_block_operations(
                 self.site.clone(),
                 block_ptr_to.clone(),
@@ -199,7 +159,7 @@ impl SyncStore {
         current_ptr: &BlockPtr,
         parent_ptr: &BlockPtr,
     ) -> Result<UnfailOutcome, StoreError> {
-        self.retry("unfail_deterministic_error", || {
+        retry::forever(&self.logger, "unfail_deterministic_error", || {
             self.writable
                 .unfail_deterministic_error(self.site.clone(), current_ptr, parent_ptr)
         })
@@ -209,14 +169,14 @@ impl SyncStore {
         &self,
         current_ptr: &BlockPtr,
     ) -> Result<UnfailOutcome, StoreError> {
-        self.retry("unfail_non_deterministic_error", || {
+        retry::forever(&self.logger, "unfail_non_deterministic_error", || {
             self.writable
                 .unfail_non_deterministic_error(self.site.clone(), current_ptr)
         })
     }
 
     async fn fail_subgraph(&self, error: SubgraphError) -> Result<(), StoreError> {
-        self.retry_async("fail_subgraph", || {
+        retry::forever_async(&self.logger, "fail_subgraph", || {
             let error = error.clone();
             async {
                 self.writable
@@ -229,7 +189,7 @@ impl SyncStore {
     }
 
     async fn supports_proof_of_indexing(&self) -> Result<bool, StoreError> {
-        self.retry_async("supports_proof_of_indexing", || async {
+        retry::forever_async(&self.logger, "supports_proof_of_indexing", || async {
             self.writable
                 .supports_proof_of_indexing(self.site.clone())
                 .await
@@ -238,7 +198,7 @@ impl SyncStore {
     }
 
     fn get(&self, key: &EntityKey, block: BlockNumber) -> Result<Option<Entity>, StoreError> {
-        self.retry("get", || {
+        retry::forever(&self.logger, "get", || {
             self.writable.get(self.site.cheap_clone(), key, block)
         })
     }
@@ -254,8 +214,9 @@ impl SyncStore {
         manifest_idx_and_name: &[(u32, String)],
         processed_data_sources: &[StoredDynamicDataSource],
     ) -> Result<(), StoreError> {
-        self.retry("transact_block_operations", move || {
+        retry::forever(&self.logger, "transact_block_operations", move || {
             let event = self.writable.transact_block_operations(
+                &self.logger,
                 self.site.clone(),
                 block_ptr_to,
                 firehose_cursor,
@@ -286,14 +247,26 @@ impl SyncStore {
                 .push(key.entity_id.into());
         }
 
-        self.retry("get_many", || {
+        retry::forever(&self.logger, "get_many", || {
             self.writable
                 .get_many(self.site.cheap_clone(), &by_type, block)
         })
     }
 
+    fn get_derived(
+        &self,
+        key: &DerivedEntityQuery,
+        block: BlockNumber,
+        excluded_keys: Vec<EntityKey>,
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
+        retry::forever(&self.logger, "get_derived", || {
+            self.writable
+                .get_derived(self.site.cheap_clone(), key, block, &excluded_keys)
+        })
+    }
+
     async fn is_deployment_synced(&self) -> Result<bool, StoreError> {
-        self.retry_async("is_deployment_synced", || async {
+        retry::forever_async(&self.logger, "is_deployment_synced", || async {
             self.writable
                 .exists_and_synced(self.site.deployment.cheap_clone())
                 .await
@@ -301,11 +274,11 @@ impl SyncStore {
         .await
     }
 
-    fn unassign_subgraph(&self) -> Result<(), StoreError> {
-        self.retry("unassign_subgraph", || {
+    fn unassign_subgraph(&self, site: &Site) -> Result<(), StoreError> {
+        retry::forever(&self.logger, "unassign_subgraph", || {
             let pconn = self.store.primary_conn()?;
             pconn.transaction(|| -> Result<_, StoreError> {
-                let changes = pconn.unassign_subgraph(self.site.as_ref())?;
+                let changes = pconn.unassign_subgraph(site)?;
                 self.store.send_store_event(&StoreEvent::new(changes))
             })
         })
@@ -316,7 +289,7 @@ impl SyncStore {
         block: BlockNumber,
         manifest_idx_and_name: Vec<(u32, String)>,
     ) -> Result<Vec<StoredDynamicDataSource>, StoreError> {
-        self.retry_async("load_dynamic_data_sources", || async {
+        retry::forever_async(&self.logger, "load_dynamic_data_sources", || async {
             self.writable
                 .load_dynamic_data_sources(
                     self.site.cheap_clone(),
@@ -331,7 +304,7 @@ impl SyncStore {
     pub(crate) async fn causality_region_curr_val(
         &self,
     ) -> Result<Option<CausalityRegion>, StoreError> {
-        self.retry_async("causality_region_curr_val", || async {
+        retry::forever_async(&self.logger, "causality_region_curr_val", || async {
             self.writable
                 .causality_region_curr_val(self.site.cheap_clone())
                 .await
@@ -339,8 +312,16 @@ impl SyncStore {
         .await
     }
 
+    fn maybe_find_site(&self, src: DeploymentId) -> Result<Option<Arc<Site>>, StoreError> {
+        match self.store.find_site(src) {
+            Ok(site) => Ok(Some(site)),
+            Err(StoreError::DeploymentNotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     fn deployment_synced(&self) -> Result<(), StoreError> {
-        self.retry("deployment_synced", || {
+        retry::forever(&self.logger, "deployment_synced", || {
             let event = {
                 // Make sure we drop `pconn` before we call into the deployment
                 // store so that we do not hold two database connections which
@@ -351,6 +332,24 @@ impl SyncStore {
                     Ok(StoreEvent::new(changes))
                 })?
             };
+
+            // Handle on_sync actions. They only apply to copies (not
+            // grafts) so we make sure that the source, if it exists, has
+            // the same hash as `self.site`
+            if let Some(src) = self.writable.source_of_copy(&self.site)? {
+                if let Some(src) = self.maybe_find_site(src)? {
+                    if src.deployment == self.site.deployment {
+                        let on_sync = self.writable.on_sync(&self.site)?;
+                        if on_sync.activate() {
+                            let pconn = self.store.primary_conn()?;
+                            pconn.activate(&self.site.as_ref().into())?;
+                        }
+                        if on_sync.replace() {
+                            self.unassign_subgraph(&src)?;
+                        }
+                    }
+                }
+            }
 
             self.writable.deployment_synced(&self.site.deployment)?;
 
@@ -363,13 +362,13 @@ impl SyncStore {
     }
 
     async fn health(&self) -> Result<schema::SubgraphHealth, StoreError> {
-        self.retry_async("health", || async {
+        retry::forever_async(&self.logger, "health", || async {
             self.writable.health(&self.site).await.map(Into::into)
         })
         .await
     }
 
-    fn input_schema(&self) -> Arc<Schema> {
+    fn input_schema(&self) -> Arc<InputSchema> {
         self.input_schema.clone()
     }
 }
@@ -452,6 +451,29 @@ enum Request {
     Stop,
 }
 
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Write {
+                block_ptr,
+                mods,
+                store,
+                ..
+            } => write!(
+                f,
+                "write[{}, {:p}, {} entities]",
+                block_ptr.number,
+                store.as_ref(),
+                mods.len()
+            ),
+            Self::RevertTo {
+                block_ptr, store, ..
+            } => write!(f, "revert[{}, {:p}]", block_ptr.number, store.as_ref()),
+            Self::Stop => write!(f, "stop"),
+        }
+    }
+}
+
 enum ExecResult {
     Continue,
     Stop,
@@ -489,7 +511,7 @@ impl Request {
             } => store
                 .revert_block_operations(block_ptr.clone(), firehose_cursor)
                 .map(|()| ExecResult::Continue),
-            Request::Stop => return Ok(ExecResult::Stop),
+            Request::Stop => Ok(ExecResult::Stop),
         }
     }
 }
@@ -524,28 +546,56 @@ struct Queue {
 /// allowed to process as many requests as it can
 #[cfg(debug_assertions)]
 pub(crate) mod test_support {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
 
-    use graph::{prelude::lazy_static, util::bounded_queue::BoundedQueue};
+    use graph::{
+        components::store::{DeploymentId, DeploymentLocator},
+        prelude::lazy_static,
+        util::bounded_queue::BoundedQueue,
+    };
 
     lazy_static! {
-        static ref DO_STEP: AtomicBool = AtomicBool::new(false);
-        static ref ALLOWED_STEPS: BoundedQueue<()> = BoundedQueue::with_capacity(1_000);
+        static ref STEPS: Mutex<HashMap<DeploymentId, Arc<BoundedQueue<()>>>> =
+            Mutex::new(HashMap::new());
     }
 
-    pub(super) async fn take_step() {
-        if DO_STEP.load(Ordering::SeqCst) {
-            ALLOWED_STEPS.pop().await
+    pub(super) async fn take_step(deployment: &DeploymentLocator) {
+        let steps = STEPS.lock().unwrap().get(&deployment.id).cloned();
+        if let Some(steps) = steps {
+            steps.pop().await;
         }
     }
 
     /// Allow the writer to process `steps` requests. After calling this,
     /// the writer will only process the number of requests it is allowed to
-    pub async fn allow_steps(steps: usize) {
+    pub async fn allow_steps(deployment: &DeploymentLocator, steps: usize) {
+        let queue = {
+            let mut map = STEPS.lock().unwrap();
+            map.entry(deployment.id)
+                .or_insert_with(|| Arc::new(BoundedQueue::with_capacity(1_000)))
+                .clone()
+        };
         for _ in 0..steps {
-            ALLOWED_STEPS.push(()).await
+            queue.push(()).await
         }
-        DO_STEP.store(true, Ordering::SeqCst);
+    }
+}
+
+impl std::fmt::Debug for Queue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reqs = self.queue.fold(vec![], |mut reqs, req| {
+            reqs.push(req.clone());
+            reqs
+        });
+
+        write!(f, "reqs[{} : ", self.store.site)?;
+        for req in reqs {
+            write!(f, " {:?}", req)?;
+        }
+        writeln!(f, "]")
     }
 }
 
@@ -555,12 +605,12 @@ impl Queue {
         logger: Logger,
         store: Arc<SyncStore>,
         capacity: usize,
-        registry: Arc<dyn MetricsRegistry>,
-    ) -> Arc<Self> {
+        registry: Arc<MetricsRegistry>,
+    ) -> (Arc<Self>, JoinHandle<()>) {
         async fn start_writer(queue: Arc<Queue>, logger: Logger) {
             loop {
                 #[cfg(debug_assertions)]
-                test_support::take_step().await;
+                test_support::take_step(&queue.store.site.as_ref().into()).await;
 
                 // We peek at the front of the queue, rather than pop it
                 // right away, so that query methods like `get` have access
@@ -627,9 +677,9 @@ impl Queue {
         };
         let queue = Arc::new(queue);
 
-        graph::spawn(start_writer(queue.cheap_clone(), logger));
+        let handle = graph::spawn(start_writer(queue.cheap_clone(), logger));
 
-        queue
+        (queue, handle)
     }
 
     /// Add a write request to the queue
@@ -641,6 +691,7 @@ impl Queue {
 
     /// Wait for the background writer to finish processing queued entries
     async fn flush(&self) -> Result<(), StoreError> {
+        self.check_err()?;
         self.queue.wait_empty().await;
         self.check_err()
     }
@@ -761,6 +812,70 @@ impl Queue {
         Ok(map)
     }
 
+    fn get_derived(
+        &self,
+        derived_query: &DerivedEntityQuery,
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
+        let mut tracker = BlockTracker::new();
+
+        // Get entities from entries in the queue
+        let entities_in_queue = self.queue.fold(
+            BTreeMap::new(),
+            |mut map: BTreeMap<EntityKey, Option<Entity>>, req| {
+                tracker.update(req.as_ref());
+                match req.as_ref() {
+                    Request::Write {
+                        block_ptr, mods, ..
+                    } => {
+                        if tracker.visible(block_ptr) {
+                            for emod in mods {
+                                let key = emod.entity_ref();
+                                // we select just the entities that match the query
+                                if derived_query.entity_type == key.entity_type {
+                                    if let Some(entity) = emod.entity().cloned() {
+                                        if let Some(related_id) =
+                                            entity.get(derived_query.entity_field.as_str())
+                                        {
+                                            // we check only the field agains the value
+                                            if related_id.to_string()
+                                                == derived_query.value.to_string()
+                                            {
+                                                map.insert(key.clone(), Some(entity));
+                                            }
+                                        }
+                                    } else {
+                                        // if the entity was deleted, we add here with no checks
+                                        // just for removing from the query
+                                        map.insert(key.clone(), emod.entity().cloned());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Request::RevertTo { .. } | Request::Stop => { /* nothing to do */ }
+                }
+                map
+            },
+        );
+
+        let excluded_keys: Vec<EntityKey> = entities_in_queue.keys().cloned().collect();
+
+        // We filter to exclude the entities ids that we already have from the queue
+        let mut items_from_database =
+            self.store
+                .get_derived(derived_query, tracker.query_block(), excluded_keys)?;
+
+        // Extend the store results with the entities from the queue.
+        // This overwrites any entitiy from the database with the same key from queue
+        let items_from_queue: BTreeMap<EntityKey, Entity> = entities_in_queue
+            .into_iter()
+            .filter_map(|(key, entity)| entity.map(|entity| (key, entity)))
+            .collect();
+        items_from_database.extend(items_from_queue);
+
+        Ok(items_from_database)
+    }
+
     /// Load dynamic data sources by looking at both the queue and the store
     async fn load_dynamic_data_sources(
         &self,
@@ -786,10 +901,7 @@ impl Queue {
                 } => {
                     if tracker.visible(block_ptr) {
                         dds.extend(data_sources.clone());
-                        dds = dds
-                            .into_iter()
-                            .filter(|dds| !processed_data_sources.contains(dds))
-                            .collect();
+                        dds.retain(|dds| !processed_data_sources.contains(dds));
                     }
                 }
                 Request::RevertTo { .. } | Request::Stop => { /* nothing to do */ }
@@ -814,12 +926,19 @@ impl Queue {
     fn poisoned(&self) -> bool {
         self.poisoned.load(Ordering::SeqCst)
     }
+
+    fn deployment_synced(&self) {
+        self.stopwatch.disable()
+    }
 }
 
 /// A shim to allow bypassing any pipelined store handling if need be
 enum Writer {
     Sync(Arc<SyncStore>),
-    Async(Arc<Queue>),
+    Async {
+        queue: Arc<Queue>,
+        join_handle: JoinHandle<()>,
+    },
 }
 
 impl Writer {
@@ -827,13 +946,32 @@ impl Writer {
         logger: Logger,
         store: Arc<SyncStore>,
         capacity: usize,
-        registry: Arc<dyn MetricsRegistry>,
+        registry: Arc<MetricsRegistry>,
     ) -> Self {
         info!(logger, "Starting subgraph writer"; "queue_size" => capacity);
         if capacity == 0 {
             Self::Sync(store)
         } else {
-            Self::Async(Queue::start(logger, store, capacity, registry))
+            let (queue, join_handle) = Queue::start(logger, store.clone(), capacity, registry);
+            Self::Async { queue, join_handle }
+        }
+    }
+
+    fn check_queue_running(&self) -> Result<(), StoreError> {
+        match self {
+            Writer::Sync(_) => Ok(()),
+            Writer::Async { join_handle, queue } => {
+                // If there was an error, report that instead of a naked 'writer not running'
+                queue.check_err()?;
+                if join_handle.is_finished() {
+                    Err(constraint_violation!(
+                        "Subgraph writer for {} is not running",
+                        queue.store.site
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -853,13 +991,14 @@ impl Writer {
                 &block_ptr_to,
                 &firehose_cursor,
                 &mods,
-                &stopwatch,
+                stopwatch,
                 &data_sources,
                 &deterministic_errors,
                 &manifest_idx_and_name,
                 &processed_data_sources,
             ),
-            Writer::Async(queue) => {
+            Writer::Async { queue, .. } => {
+                self.check_queue_running()?;
                 let req = Request::Write {
                     store: queue.store.cheap_clone(),
                     stopwatch: queue.stopwatch.cheap_clone(),
@@ -883,7 +1022,8 @@ impl Writer {
     ) -> Result<(), StoreError> {
         match self {
             Writer::Sync(store) => store.revert_block_operations(block_ptr_to, &firehose_cursor),
-            Writer::Async(queue) => {
+            Writer::Async { queue, .. } => {
+                self.check_queue_running()?;
                 let req = Request::RevertTo {
                     store: queue.store.cheap_clone(),
                     block_ptr: block_ptr_to,
@@ -897,14 +1037,17 @@ impl Writer {
     async fn flush(&self) -> Result<(), StoreError> {
         match self {
             Writer::Sync { .. } => Ok(()),
-            Writer::Async(queue) => queue.flush().await,
+            Writer::Async { queue, .. } => {
+                self.check_queue_running()?;
+                queue.flush().await
+            }
         }
     }
 
     fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError> {
         match self {
             Writer::Sync(store) => store.get(key, BLOCK_NUMBER_MAX),
-            Writer::Async(queue) => queue.get(key),
+            Writer::Async { queue, .. } => queue.get(key),
         }
     }
 
@@ -914,7 +1057,17 @@ impl Writer {
     ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
         match self {
             Writer::Sync(store) => store.get_many(keys, BLOCK_NUMBER_MAX),
-            Writer::Async(queue) => queue.get_many(keys),
+            Writer::Async { queue, .. } => queue.get_many(keys),
+        }
+    }
+
+    fn get_derived(
+        &self,
+        key: &DerivedEntityQuery,
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
+        match self {
+            Writer::Sync(store) => store.get_derived(key, BLOCK_NUMBER_MAX, vec![]),
+            Writer::Async { queue, .. } => queue.get_derived(key),
         }
     }
 
@@ -928,21 +1081,30 @@ impl Writer {
                     .load_dynamic_data_sources(BLOCK_NUMBER_MAX, manifest_idx_and_name)
                     .await
             }
-            Writer::Async(queue) => queue.load_dynamic_data_sources(manifest_idx_and_name).await,
+            Writer::Async { queue, .. } => {
+                queue.load_dynamic_data_sources(manifest_idx_and_name).await
+            }
         }
     }
 
     fn poisoned(&self) -> bool {
         match self {
             Writer::Sync(_) => false,
-            Writer::Async(queue) => queue.poisoned(),
+            Writer::Async { queue, .. } => queue.poisoned(),
         }
     }
 
     async fn stop(&self) -> Result<(), StoreError> {
         match self {
             Writer::Sync(_) => Ok(()),
-            Writer::Async(queue) => queue.stop().await,
+            Writer::Async { queue, .. } => queue.stop().await,
+        }
+    }
+
+    fn deployment_synced(&self) {
+        match self {
+            Writer::Sync(_) => {}
+            Writer::Async { queue, .. } => queue.deployment_synced(),
         }
     }
 }
@@ -959,7 +1121,7 @@ impl WritableStore {
         subgraph_store: SubgraphStore,
         logger: Logger,
         site: Arc<Site>,
-        registry: Arc<dyn MetricsRegistry>,
+        registry: Arc<MetricsRegistry>,
     ) -> Result<Self, StoreError> {
         let store = Arc::new(SyncStore::new(subgraph_store, logger.clone(), site)?);
         let block_ptr = Mutex::new(store.block_ptr().await?);
@@ -1000,21 +1162,30 @@ impl ReadStore for WritableStore {
         self.writer.get_many(keys)
     }
 
-    fn input_schema(&self) -> Arc<Schema> {
+    fn get_derived(
+        &self,
+        key: &DerivedEntityQuery,
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
+        self.writer.get_derived(key)
+    }
+
+    fn input_schema(&self) -> Arc<InputSchema> {
         self.store.input_schema()
+    }
+}
+
+impl DeploymentCursorTracker for WritableStore {
+    fn block_ptr(&self) -> Option<BlockPtr> {
+        self.block_ptr.lock().unwrap().clone()
+    }
+
+    fn firehose_cursor(&self) -> FirehoseCursor {
+        self.block_cursor.lock().unwrap().clone()
     }
 }
 
 #[async_trait::async_trait]
 impl WritableStoreTrait for WritableStore {
-    fn block_ptr(&self) -> Option<BlockPtr> {
-        self.block_ptr.lock().unwrap().clone()
-    }
-
-    fn block_cursor(&self) -> FirehoseCursor {
-        self.block_cursor.lock().unwrap().clone()
-    }
-
     async fn start_subgraph_deployment(&self, logger: &Logger) -> Result<(), StoreError> {
         let store = self.store.cheap_clone();
         let logger = logger.cheap_clone();
@@ -1106,6 +1277,7 @@ impl WritableStoreTrait for WritableStore {
     }
 
     fn deployment_synced(&self) -> Result<(), StoreError> {
+        self.writer.deployment_synced();
         self.store.deployment_synced()
     }
 
@@ -1114,7 +1286,7 @@ impl WritableStoreTrait for WritableStore {
     }
 
     fn unassign_subgraph(&self) -> Result<(), StoreError> {
-        self.store.unassign_subgraph()
+        self.store.unassign_subgraph(&self.store.site)
     }
 
     async fn load_dynamic_data_sources(
@@ -1142,5 +1314,34 @@ impl WritableStoreTrait for WritableStore {
 
     async fn flush(&self) -> Result<(), StoreError> {
         self.writer.flush().await
+    }
+
+    async fn restart(self: Arc<Self>) -> Result<Option<Arc<dyn WritableStoreTrait>>, StoreError> {
+        if self.poisoned() {
+            // When the writer is poisoned, the background thread has
+            // finished since `start_writer` returns whenever it encounters
+            // an error. Just to make extra-sure, we log a warning if the
+            // join handle indicates that the writer hasn't stopped yet.
+            let logger = self.store.logger.clone();
+            match &self.writer {
+                Writer::Sync(_) => { /* can't happen, a sync writer never gets poisoned */ }
+                Writer::Async { join_handle, queue } => {
+                    let err = match queue.check_err() {
+                        Ok(()) => "error missing".to_string(),
+                        Err(e) => e.to_string(),
+                    };
+                    if !join_handle.is_finished() {
+                        warn!(logger, "Writer was poisoned, but background thread didn't finish. Creating new writer regardless"; "error" => err);
+                    }
+                }
+            }
+            let store = Arc::new(self.store.store.0.clone());
+            store
+                .writable(logger, self.store.site.id.into())
+                .await
+                .map(|store| Some(store))
+        } else {
+            Ok(None)
+        }
     }
 }

@@ -1,6 +1,7 @@
 use futures::future;
 use futures::prelude::*;
 use futures03::{future::BoxFuture, stream::FuturesUnordered};
+use graph::blockchain::client::ChainClient;
 use graph::blockchain::BlockHash;
 use graph::blockchain::ChainIdentifier;
 use graph::components::transaction_receipt::LightTransactionReceipt;
@@ -9,6 +10,7 @@ use graph::data::subgraph::API_VERSION_0_0_7;
 use graph::prelude::ethabi::ParamType;
 use graph::prelude::ethabi::Token;
 use graph::prelude::tokio::try_join;
+use graph::slog::o;
 use graph::{
     blockchain::{block_stream::BlockWithTriggers, BlockPtr, IngestorError},
     prelude::{
@@ -43,6 +45,8 @@ use std::time::Instant;
 
 use crate::adapter::ProviderStatus;
 use crate::chain::BlockFinality;
+use crate::Chain;
+use crate::NodeCapabilities;
 use crate::{
     adapter::{
         EthGetLogsFilter, EthereumAdapter as EthereumAdapterTrait, EthereumBlockFilter,
@@ -54,56 +58,42 @@ use crate::{
     TriggerFilter, ENV_VARS,
 };
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct EthereumAdapter {
     logger: Logger,
-    url_hostname: Arc<String>,
-    /// The label for the provider from the configuration
     provider: String,
     web3: Arc<Web3<Transport>>,
     metrics: Arc<ProviderEthRpcMetrics>,
     supports_eip_1898: bool,
+    call_only: bool,
 }
-
-/// Gas limit for `eth_call`. The value of 50_000_000 is a protocol-wide parameter so this
-/// should be changed only for debugging purposes and never on an indexer in the network. This
-/// value was chosen because it is the Geth default
-/// https://github.com/ethereum/go-ethereum/blob/e4b687cf462870538743b3218906940ae590e7fd/eth/ethconfig/config.go#L91.
-/// It is not safe to set something higher because Geth will silently override the gas limit
-/// with the default. This means that we do not support indexing against a Geth node with
-/// `RPCGasCap` set below 50 million.
-// See also f0af4ab0-6b7c-4b68-9141-5b79346a5f61.
-const ETH_CALL_GAS: u32 = 50_000_000;
 
 impl CheapClone for EthereumAdapter {
     fn cheap_clone(&self) -> Self {
         Self {
             logger: self.logger.clone(),
             provider: self.provider.clone(),
-            url_hostname: self.url_hostname.cheap_clone(),
             web3: self.web3.cheap_clone(),
             metrics: self.metrics.cheap_clone(),
             supports_eip_1898: self.supports_eip_1898,
+            call_only: self.call_only,
         }
     }
 }
 
 impl EthereumAdapter {
+    pub fn is_call_only(&self) -> bool {
+        self.call_only
+    }
+
     pub async fn new(
         logger: Logger,
         provider: String,
-        url: &str,
         transport: Transport,
         provider_metrics: Arc<ProviderEthRpcMetrics>,
         supports_eip_1898: bool,
+        call_only: bool,
     ) -> Self {
-        // Unwrap: The transport was constructed with this url, so it is valid and has a host.
-        let hostname = graph::url::Url::parse(url)
-            .unwrap()
-            .host_str()
-            .unwrap()
-            .to_string();
-
         let web3 = Arc::new(Web3::new(transport));
 
         // Use the client version to check if it is ganache. For compatibility with unit tests, be
@@ -118,10 +108,10 @@ impl EthereumAdapter {
         EthereumAdapter {
             logger,
             provider,
-            url_hostname: Arc::new(hostname),
             web3,
             metrics: provider_metrics,
             supports_eip_1898: supports_eip_1898 && !is_ganache,
+            call_only,
         }
     }
 
@@ -133,6 +123,8 @@ impl EthereumAdapter {
         to: BlockNumber,
         addresses: Vec<H160>,
     ) -> Result<Vec<Trace>, Error> {
+        assert!(!self.call_only);
+
         let eth = self.clone();
         let retry_log_message =
             format!("trace_filter RPC call for block range: [{}..{}]", from, to);
@@ -225,6 +217,8 @@ impl EthereumAdapter {
         filter: Arc<EthGetLogsFilter>,
         too_many_logs_fingerprints: &'static [&'static str],
     ) -> Result<Vec<Log>, TimeoutError<web3::error::Error>> {
+        assert!(!self.call_only);
+
         let eth_adapter = self.clone();
         let retry_log_message = format!("eth_getLogs RPC call for block range: [{}..{}]", from, to);
         retry(retry_log_message, &logger)
@@ -291,7 +285,7 @@ impl EthereumAdapter {
         };
 
         let eth = self;
-        let logger = logger.to_owned();
+        let logger = logger.clone();
         stream::unfold(from, move |start| {
             if start > to {
                 return None;
@@ -421,8 +415,10 @@ impl EthereumAdapter {
         contract_address: Address,
         call_data: Bytes,
         block_ptr: BlockPtr,
+        gas: Option<u32>,
     ) -> impl Future<Item = Bytes, Error = EthereumContractCallError> + Send {
         let web3 = self.web3.clone();
+        let logger = Logger::new(&logger, o!("provider" => self.provider.clone()));
 
         // Ganache does not support calls by block hash.
         // See https://github.com/trufflesuite/ganache-cli/issues/973
@@ -442,11 +438,10 @@ impl EthereumAdapter {
             .run(move || {
                 let call_data = call_data.clone();
                 let web3 = web3.cheap_clone();
-
                 async move {
                     let req = CallRequest {
                         to: Some(contract_address),
-                        gas: Some(web3::types::U256::from(ETH_CALL_GAS)),
+                        gas: gas.map(|val| web3::types::U256::from(val)),
                         data: Some(call_data.clone()),
                         from: None,
                         gas_price: None,
@@ -825,10 +820,6 @@ impl EthereumAdapter {
 
 #[async_trait]
 impl EthereumAdapterTrait for EthereumAdapter {
-    fn url_hostname(&self) -> &str {
-        &self.url_hostname
-    }
-
     fn provider(&self) -> &str {
         &self.provider
     }
@@ -1200,7 +1191,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         };
 
         debug!(logger, "eth_call";
-            "address" => hex::encode(&call.address),
+            "address" => hex::encode(call.address),
             "data" => hex::encode(&call_data)
         );
 
@@ -1225,6 +1216,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
                             call.address,
                             Bytes(call_data.clone()),
                             call.block_ptr.clone(),
+                            call.gas,
                         )
                         .map(move |result| {
                             // Don't block handler execution on writing to the cache.
@@ -1346,7 +1338,7 @@ pub(crate) async fn blocks_with_triggers(
     // Scan for Logs
     if !filter.log.is_empty() {
         let logs_future = get_logs_and_transactions(
-            eth.clone(),
+            &eth,
             &logger,
             subgraph_metrics.clone(),
             from,
@@ -1371,7 +1363,7 @@ pub(crate) async fn blocks_with_triggers(
 
     // Scan for Blocks
     if filter.block.trigger_every_block {
-        let block_future = adapter
+        let block_future = eth
             .block_range_to_ptrs(logger.clone(), from, to)
             .map(move |ptrs| {
                 ptrs.into_iter()
@@ -1400,14 +1392,14 @@ pub(crate) async fn blocks_with_triggers(
     }
 
     // Get hash for "to" block
-    let to_hash_fut = adapter
+    let to_hash_fut = eth
         .block_hash_by_block_number(&logger, to)
         .and_then(|hash| match hash {
             Some(hash) => Ok(hash),
             None => {
                 warn!(logger,
                       "Ethereum endpoint is behind";
-                      "url" => eth.url_hostname()
+                      "url" => eth.provider()
                 );
                 bail!("Block {} not found in the chain", to)
             }
@@ -1434,11 +1426,11 @@ pub(crate) async fn blocks_with_triggers(
 
     // Make sure `to` is included, even if empty.
     block_hashes.insert(to_hash);
-    triggers_by_block.entry(to).or_insert(Vec::new());
+    triggers_by_block.entry(to).or_default();
 
     let logger2 = logger.cheap_clone();
 
-    let blocks = adapter
+    let blocks = eth
         .load_blocks(logger.cheap_clone(), chain_store.clone(), block_hashes)
         .and_then(
             move |block| match triggers_by_block.remove(&(block.number() as BlockNumber)) {
@@ -1488,9 +1480,10 @@ pub(crate) async fn blocks_with_triggers(
 }
 
 pub(crate) async fn get_calls(
-    adapter: &EthereumAdapter,
+    client: &Arc<ChainClient<Chain>>,
     logger: Logger,
     subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
+    capabilities: &NodeCapabilities,
     requires_traces: bool,
     block: BlockFinality,
 ) -> Result<BlockFinality, Error> {
@@ -1510,7 +1503,9 @@ pub(crate) async fn get_calls(
             let calls = if !requires_traces || ethereum_block.transaction_receipts.is_empty() {
                 vec![]
             } else {
-                adapter
+                client
+                    .rpc()?
+                    .cheapest_with(capabilities)?
                     .calls_in_block(
                         &logger,
                         subgraph_metrics.clone(),
@@ -1893,7 +1888,7 @@ fn resolve_transaction_receipt(
 
 /// Retrieves logs and the associated transaction receipts, if required by the [`EthereumLogFilter`].
 async fn get_logs_and_transactions(
-    adapter: Arc<EthereumAdapter>,
+    adapter: &Arc<EthereumAdapter>,
     logger: &Logger,
     subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
     from: BlockNumber,
@@ -1943,7 +1938,7 @@ async fn get_logs_and_transactions(
 
     // Obtain receipts externally
     let transaction_receipts_by_hash = get_transaction_receipts_for_transaction_hashes(
-        &adapter,
+        adapter,
         &transaction_hashes_by_block,
         subgraph_metrics,
         logger.cheap_clone(),

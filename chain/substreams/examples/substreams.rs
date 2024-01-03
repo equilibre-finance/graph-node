@@ -1,11 +1,13 @@
 use anyhow::{format_err, Context, Error};
 use graph::blockchain::block_stream::BlockStreamEvent;
+use graph::blockchain::client::ChainClient;
 use graph::blockchain::substreams_block_stream::SubstreamsBlockStream;
-use graph::prelude::{info, tokio, DeploymentHash, Registry};
+use graph::endpoint::EndpointMetrics;
+use graph::firehose::{FirehoseEndpoints, SubgraphLimit};
+use graph::prelude::{info, tokio, DeploymentHash, MetricsRegistry, Registry};
 use graph::tokio_stream::StreamExt;
 use graph::{env::env_var, firehose::FirehoseEndpoint, log::logger, substreams};
 use graph_chain_substreams::mapper::Mapper;
-use graph_core::MetricsRegistry;
 use prost::Message;
 use std::env;
 use std::sync::Arc;
@@ -40,18 +42,30 @@ async fn main() -> Result<(), Error> {
         prometheus_registry.clone(),
     ));
 
+    let endpoint_metrics = EndpointMetrics::new(
+        logger.clone(),
+        &[endpoint.clone()],
+        Arc::new(MetricsRegistry::mock()),
+    );
+
     let firehose = Arc::new(FirehoseEndpoint::new(
         "substreams",
         &endpoint,
         token,
         false,
         false,
+        SubgraphLimit::Unlimited,
+        Arc::new(endpoint_metrics),
     ));
+
+    let client = Arc::new(ChainClient::new_firehose(FirehoseEndpoints::from(vec![
+        firehose,
+    ])));
 
     let mut stream: SubstreamsBlockStream<graph_chain_substreams::Chain> =
         SubstreamsBlockStream::new(
             DeploymentHash::new("substreams".to_string()).unwrap(),
-            firehose.clone(),
+            client,
             None,
             None,
             Arc::new(Mapper {}),

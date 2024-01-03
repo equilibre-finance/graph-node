@@ -1,5 +1,5 @@
 use crate::polling_monitor::IpfsService;
-use crate::subgraph::context::{IndexingContext, SharedInstanceKeepAliveMap};
+use crate::subgraph::context::{IndexingContext, SubgraphKeepAlive};
 use crate::subgraph::inputs::IndexingInputs;
 use crate::subgraph::loader::load_dynamic_data_sources;
 
@@ -26,9 +26,8 @@ pub struct SubgraphInstanceManager<S: SubgraphStore> {
     logger_factory: LoggerFactory,
     subgraph_store: Arc<S>,
     chains: Arc<BlockchainMap>,
-    metrics_registry: Arc<dyn MetricsRegistry>,
-    manager_metrics: Arc<SubgraphInstanceManagerMetrics>,
-    instances: SharedInstanceKeepAliveMap,
+    metrics_registry: Arc<MetricsRegistry>,
+    instances: SubgraphKeepAlive,
     link_resolver: Arc<dyn LinkResolver>,
     ipfs_service: IpfsService,
     static_filters: bool,
@@ -46,7 +45,6 @@ impl<S: SubgraphStore> SubgraphInstanceManagerTrait for SubgraphInstanceManager<
         let logger = self.logger_factory.subgraph_logger(&loc);
         let err_logger = logger.clone();
         let instance_manager = self.cheap_clone();
-        let manager_metrics = instance_manager.manager_metrics.clone();
 
         let subgraph_start_future = async move {
             match BlockchainKind::from_manifest(&manifest)? {
@@ -130,7 +128,7 @@ impl<S: SubgraphStore> SubgraphInstanceManagerTrait for SubgraphInstanceManager<
         // manager does not hang because of that work.
         graph::spawn(async move {
             match subgraph_start_future.await {
-                Ok(()) => manager_metrics.subgraph_count.inc(),
+                Ok(()) => {}
                 Err(err) => error!(
                     err_logger,
                     "Failed to start subgraph";
@@ -151,11 +149,7 @@ impl<S: SubgraphStore> SubgraphInstanceManagerTrait for SubgraphInstanceManager<
             }
         }
 
-        // Drop the cancel guard to shut down the subgraph now
-        let mut instances = self.instances.write().unwrap();
-        instances.remove(&loc.id);
-
-        self.manager_metrics.subgraph_count.dec();
+        self.instances.remove(&loc.id);
 
         info!(logger, "Stopped subgraph");
     }
@@ -167,7 +161,8 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
         env_vars: Arc<EnvVars>,
         subgraph_store: Arc<S>,
         chains: Arc<BlockchainMap>,
-        metrics_registry: Arc<dyn MetricsRegistry>,
+        sg_metrics: Arc<SubgraphCountMetric>,
+        metrics_registry: Arc<MetricsRegistry>,
         link_resolver: Arc<dyn LinkResolver>,
         ipfs_service: IpfsService,
         static_filters: bool,
@@ -179,11 +174,8 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
             logger_factory,
             subgraph_store,
             chains,
-            manager_metrics: Arc::new(SubgraphInstanceManagerMetrics::new(
-                metrics_registry.cheap_clone(),
-            )),
-            metrics_registry,
-            instances: SharedInstanceKeepAliveMap::default(),
+            metrics_registry: metrics_registry.cheap_clone(),
+            instances: SubgraphKeepAlive::new(sg_metrics),
             link_resolver,
             ipfs_service,
             static_filters,
@@ -237,13 +229,32 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
             }
         }
 
-        info!(logger, "Resolve subgraph files using IPFS");
+        info!(logger, "Resolve subgraph files using IPFS";
+            "n_data_sources" => manifest.data_sources.len(),
+            "n_templates" => manifest.templates.len(),
+        );
 
         let mut manifest = manifest
             .resolve(&link_resolver, &logger, ENV_VARS.max_spec_version.clone())
             .await?;
 
-        info!(logger, "Successfully resolved subgraph files using IPFS");
+        {
+            let features = if manifest.features.is_empty() {
+                "ø".to_string()
+            } else {
+                manifest
+                    .features
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            info!(logger, "Successfully resolved subgraph files using IPFS";
+                "n_data_sources" => manifest.data_sources.len(),
+                "n_templates" => manifest.templates.len(),
+                "features" => features
+            );
+        }
 
         let manifest_idx_and_name: Vec<(u32, String)> = manifest.template_idx_and_name().collect();
 
@@ -392,6 +403,7 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
         let causality_region_seq =
             CausalityRegionSeq::from_current(store.causality_region_curr_val().await?);
 
+        let instrument = self.subgraph_store.instrument(&deployment)?;
         let instance = super::context::instance::SubgraphInstance::from_manifest(
             &logger,
             manifest,
@@ -416,6 +428,7 @@ impl<S: SubgraphStore> SubgraphInstanceManager<S> {
             manifest_idx_and_name,
             poi_version,
             network,
+            instrument,
         };
 
         // The subgraph state tracks the state of the subgraph instance over time

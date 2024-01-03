@@ -87,8 +87,8 @@ where
     fn handle_subgraph_version(&self, version: &str) -> Result<Response<Body>, GraphQLServerError> {
         let vi = self.version_info(version)?;
 
-        let latest_ethereum_block_number = vi.latest_ethereum_block_number.map(|n| n as i32);
-        let total_ethereum_blocks_count = vi.total_ethereum_blocks_count.map(|n| n as i32);
+        let latest_ethereum_block_number = vi.latest_ethereum_block_number;
+        let total_ethereum_blocks_count = vi.total_ethereum_blocks_count;
         let value = object! {
             createdAt: vi.created_at.as_str(),
             deploymentId: vi.deployment_id.as_str(),
@@ -98,7 +98,7 @@ where
             failed: vi.failed,
             description: vi.description.as_deref(),
             repository: vi.repository.as_deref(),
-            schema: vi.schema.document.to_string(),
+            schema: vi.schema.document_string(),
             network: vi.network.as_str()
         };
         Ok(as_http_response(&value))

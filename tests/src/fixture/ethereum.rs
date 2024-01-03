@@ -6,20 +6,22 @@ use super::{
     test_ptr, MutexBlockStreamBuilder, NoopAdapterSelector, NoopRuntimeAdapter,
     StaticBlockRefetcher, StaticStreamBuilder, Stores, TestChain, NODE_ID,
 };
+use graph::blockchain::client::ChainClient;
 use graph::blockchain::{BlockPtr, TriggersAdapterSelector};
 use graph::cheap_clone::CheapClone;
-use graph::firehose::{FirehoseEndpoint, FirehoseEndpoints};
+use graph::endpoint::EndpointMetrics;
+use graph::firehose::{FirehoseEndpoint, FirehoseEndpoints, SubgraphLimit};
 use graph::prelude::ethabi::ethereum_types::H256;
 use graph::prelude::web3::types::{Address, Log, Transaction, H160};
-use graph::prelude::{ethabi, tiny_keccak, LightEthereumBlock, LoggerFactory, NodeId};
+use graph::prelude::{
+    ethabi, tiny_keccak, LightEthereumBlock, LoggerFactory, MetricsRegistry, NodeId, ENV_VARS,
+};
 use graph::{blockchain::block_stream::BlockWithTriggers, prelude::ethabi::ethereum_types::U64};
-use graph_chain_ethereum::network::EthereumNetworkAdapters;
+use graph_chain_ethereum::Chain;
 use graph_chain_ethereum::{
     chain::BlockFinality,
     trigger::{EthereumBlockTriggerType, EthereumTrigger},
 };
-use graph_chain_ethereum::{Chain, ENV_VARS};
-use graph_mock::MockMetricsRegistry;
 
 pub async fn chain(
     blocks: Vec<BlockWithTriggers<Chain>>,
@@ -31,13 +33,13 @@ pub async fn chain(
         x: PhantomData,
     }));
     let logger = graph::log::logger(true);
-    let mock_registry = Arc::new(MockMetricsRegistry::new());
+    let mock_registry = Arc::new(MetricsRegistry::mock());
     let logger_factory = LoggerFactory::new(logger.cheap_clone(), None, mock_registry.clone());
     let node_id = NodeId::new(NODE_ID).unwrap();
 
     let chain_store = stores.chain_store.cheap_clone();
 
-    // This is needed bacause the stream builder only works for firehose and this will only be called if there
+    // This is needed because the stream builder only works for firehose and this will only be called if there
     // are > 1 firehose endpoints. The endpoint itself is never used because it's mocked.
     let firehose_endpoints: FirehoseEndpoints = vec![Arc::new(FirehoseEndpoint::new(
         "",
@@ -45,27 +47,31 @@ pub async fn chain(
         None,
         true,
         false,
+        SubgraphLimit::Unlimited,
+        Arc::new(EndpointMetrics::mock()),
     ))]
     .into();
+
+    let client = Arc::new(ChainClient::<Chain>::new_firehose(firehose_endpoints));
 
     let static_block_stream = Arc::new(StaticStreamBuilder { chain: blocks });
     let block_stream_builder = Arc::new(MutexBlockStreamBuilder(Mutex::new(static_block_stream)));
 
     let chain = Chain::new(
-        logger_factory.clone(),
+        logger_factory,
         stores.network_name.clone(),
         node_id,
-        mock_registry.clone(),
+        mock_registry,
         chain_store.cheap_clone(),
         chain_store,
-        firehose_endpoints,
-        EthereumNetworkAdapters { adapters: vec![] },
+        client,
         stores.chain_head_listener.cheap_clone(),
         block_stream_builder.clone(),
         Arc::new(StaticBlockRefetcher { x: PhantomData }),
         triggers_adapter,
         Arc::new(NoopRuntimeAdapter { x: PhantomData }),
         ENV_VARS.reorg_threshold,
+        graph_chain_ethereum::ENV_VARS.ingestor_polling_interval,
         // We assume the tested chain is always ingestible for now
         true,
     );
@@ -98,7 +104,7 @@ pub fn empty_block(
     // A 0x000.. transaction is used so `push_test_log` can use it
     let transactions = vec![Transaction {
         hash: H256::zero(),
-        block_hash: Some(H256::from_slice(ptr.hash.as_slice().into())),
+        block_hash: Some(H256::from_slice(ptr.hash.as_slice())),
         block_number: Some(ptr.number.into()),
         transaction_index: Some(0.into()),
         from: Some(H160::zero()),
@@ -126,7 +132,7 @@ pub fn push_test_log(block: &mut BlockWithTriggers<Chain>, payload: impl Into<St
             data: ethabi::encode(&[ethabi::Token::String(payload.into())]).into(),
             block_hash: Some(H256::from_slice(block.ptr().hash.as_slice())),
             block_number: Some(block.ptr().number.into()),
-            transaction_hash: Some(H256::from_low_u64_be(0).into()),
+            transaction_hash: Some(H256::from_low_u64_be(0)),
             transaction_index: Some(0.into()),
             log_index: Some(0.into()),
             transaction_log_index: Some(0.into()),
